@@ -1,0 +1,405 @@
+"""
+Validation Agent
+Runs data quality checks and categorises findings by severity.
+Never transforms data — inspect and report only.
+"""
+
+from pathlib import Path
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Individual check functions  (from validation SKILL)
+# ---------------------------------------------------------------------------
+
+def _validate_target(df: pd.DataFrame, target_col: str, task_type: str) -> list:
+    results = []
+
+    if target_col not in df.columns:
+        results.append({
+            "check":    "target_exists",
+            "severity": "hard_stop",
+            "message":  f"The column '{target_col}' was not found in your data.",
+            "action":   "Please check the column name and try again."
+        })
+        return results
+
+    target = df[target_col]
+
+    if target.isna().all():
+        results.append({
+            "check":    "target_not_empty",
+            "severity": "hard_stop",
+            "message":  f"The column '{target_col}' appears to be completely empty.",
+            "action":   "Please check your data source and try again."
+        })
+
+    missing_pct = target.isna().mean()
+    if missing_pct > 0.05:
+        results.append({
+            "check":    "target_missing_values",
+            "severity": "hard_stop",
+            "message":  f"{missing_pct:.1%} of your target column values are missing.",
+            "action":   "Rows with a missing target value cannot be used for training. We recommend removing them."
+        })
+    elif missing_pct > 0:
+        results.append({
+            "check":    "target_missing_values",
+            "severity": "warning",
+            "message":  f"{target.isna().sum()} rows have a missing target value ({missing_pct:.1%}).",
+            "action":   "These rows will be dropped before training."
+        })
+
+    if task_type in ("binary_classification", "multiclass_classification") and not target.isna().all():
+        counts       = target.value_counts()
+        pcts         = target.value_counts(normalize=True)
+        minority_pct = float(pcts.min())
+        majority_pct = float(pcts.max())
+        minority_cls = pcts.idxmin()
+        majority_cls = pcts.idxmax()
+        if minority_pct < 0.05:
+            results.append({
+                "check":       "class_imbalance",
+                "severity":    "warning",
+                "minority_pct": minority_pct,
+                "majority_pct": majority_pct,
+                "minority_cls": str(minority_cls),
+                "majority_cls": str(majority_cls),
+                "counts":       counts.to_dict(),
+                "message": (
+                    f"Your data is heavily imbalanced. "
+                    f"{majority_pct:.0%} of rows are '{majority_cls}', "
+                    f"but only {minority_pct:.1%} are '{minority_cls}'. "
+                    f"A model that just always predicts '{majority_cls}' would score {majority_pct:.0%} accuracy — "
+                    f"but it would never actually identify '{minority_cls}' at all."
+                ),
+                "action": "You will be asked to choose how to handle this."
+            })
+        elif minority_pct < 0.30:
+            results.append({
+                "check":       "class_imbalance",
+                "severity":    "advisory",
+                "minority_pct": minority_pct,
+                "majority_pct": majority_pct,
+                "minority_cls": str(minority_cls),
+                "majority_cls": str(majority_cls),
+                "counts":       counts.to_dict(),
+                "message": (
+                    f"Your data has a moderate imbalance — {minority_pct:.0%} '{minority_cls}' vs "
+                    f"{majority_pct:.0%} '{majority_cls}'. "
+                    f"The model may learn to favour the majority class unless we correct for this."
+                ),
+                "action": "You will be asked to choose how to handle this."
+            })
+
+    return results
+
+
+def _validate_size(df: pd.DataFrame) -> list:
+    results = []
+    n_rows  = len(df)
+
+    if n_rows < 50:
+        results.append({
+            "check":    "minimum_rows",
+            "severity": "hard_stop",
+            "message":  f"Your dataset only has {n_rows} rows. This is too small to train a reliable model.",
+            "action":   "A minimum of 50 rows is needed. Ideally 500 or more."
+        })
+    elif n_rows < 200:
+        results.append({
+            "check":    "minimum_rows",
+            "severity": "warning",
+            "message":  f"Your dataset has {n_rows} rows. This is quite small — the model may not learn reliably.",
+            "action":   "We will use cross-validation to get the most out of the available data."
+        })
+    elif n_rows < 1000:
+        results.append({
+            "check":    "minimum_rows",
+            "severity": "advisory",
+            "message":  f"Your dataset has {n_rows} rows. This is workable but more data generally produces better results."
+        })
+
+    return results
+
+
+def _validate_missing(df: pd.DataFrame) -> list:
+    results = []
+    missing = df.isna().mean()
+
+    for col, pct in missing[missing > 0].items():
+        if pct > 0.8:
+            results.append({
+                "check":       "missing_values",
+                "severity":    "warning",
+                "column":      col,
+                "missing_pct": round(float(pct), 4),
+                "message":     f"'{col}' is {pct:.1%} empty. This column may not be useful.",
+                "action":      "We recommend dropping this column. You will be asked to confirm."
+            })
+        elif pct > 0.3:
+            results.append({
+                "check":       "missing_values",
+                "severity":    "advisory",
+                "column":      col,
+                "missing_pct": round(float(pct), 4),
+                "message":     f"'{col}' has {pct:.1%} missing values. We will handle this during cleaning."
+            })
+
+    return results
+
+
+def _validate_duplicates(df: pd.DataFrame) -> list:
+    results   = []
+    dup_count = int(df.duplicated().sum())
+    dup_pct   = dup_count / len(df)
+
+    if dup_pct > 0.1:
+        results.append({
+            "check":    "duplicates",
+            "severity": "warning",
+            "message":  f"{dup_count} duplicate rows found ({dup_pct:.1%} of your data).",
+            "action":   "We recommend removing duplicates. You will be asked to confirm."
+        })
+    elif dup_count > 0:
+        results.append({
+            "check":    "duplicates",
+            "severity": "advisory",
+            "message":  f"{dup_count} duplicate rows found. These will be removed during cleaning."
+        })
+
+    return results
+
+
+def _validate_variance(df: pd.DataFrame) -> list:
+    results = []
+
+    for col in df.columns:
+        n_unique = df[col].nunique()
+        if n_unique == 1:
+            results.append({
+                "check":    "constant_column",
+                "severity": "warning",
+                "column":   col,
+                "message":  f"'{col}' has only one unique value — it contains no useful information.",
+                "action":   "We recommend dropping this column. You will be asked to confirm."
+            })
+        elif n_unique / len(df) > 0.95 and df[col].dtype == object:
+            results.append({
+                "check":    "high_cardinality",
+                "severity": "advisory",
+                "column":   col,
+                "message":  f"'{col}' has {n_unique} unique text values — it may be an ID column rather than a useful feature.",
+                "action":   "We will flag this during feature engineering."
+            })
+
+    return results
+
+
+def _validate_dtypes(df: pd.DataFrame, target_col: str) -> list:
+    results = []
+
+    for col in df.columns:
+        if col == target_col:
+            continue
+        if df[col].dtype == object:
+            sample      = df[col].dropna().head(100)
+            if len(sample) == 0:
+                continue
+            numeric_pct = sample.str.match(r"^-?\d+\.?\d*$", na=False).mean()
+            if numeric_pct > 0.9:
+                results.append({
+                    "check":    "dtype_mismatch",
+                    "severity": "advisory",
+                    "column":   col,
+                    "message":  f"'{col}' looks like it contains numbers but is stored as text.",
+                    "action":   "We will convert this to a number during cleaning."
+                })
+
+    return results
+
+
+def _run_validation(df: pd.DataFrame, target_col: str, task_type: str) -> dict:
+    all_results  = []
+    all_results += _validate_target(df, target_col, task_type)
+    all_results += _validate_size(df)
+    all_results += _validate_missing(df)
+    all_results += _validate_duplicates(df)
+    all_results += _validate_variance(df)
+    all_results += _validate_dtypes(df, target_col)
+
+    hard_stops = [r for r in all_results if r["severity"] == "hard_stop"]
+    warnings   = [r for r in all_results if r["severity"] == "warning"]
+    advisories = [r for r in all_results if r["severity"] == "advisory"]
+
+    overall = "hard_stop" if hard_stops else "warnings" if warnings else "passed"
+
+    return {
+        "overall_status":   overall,
+        "hard_stops":       hard_stops,
+        "warnings":         warnings,
+        "advisories":       advisories,
+        "total_checks_run": len(all_results)
+    }
+
+
+# ---------------------------------------------------------------------------
+# run()
+# ---------------------------------------------------------------------------
+
+def run(session: dict, decisions: dict) -> dict:
+    session_id   = session["session_id"]
+    target_col   = session["goal"].get("target_column")
+    task_type    = session["goal"].get("task_type", "binary_classification")
+    sessions_dir = Path("sessions")
+
+    if not target_col:
+        return {
+            "stage":                 "validation",
+            "status":                "hard_stop",
+            "plain_english_summary": (
+                "We need to know which column you want to predict before we can validate the data. "
+                "Please confirm your goal first."
+            )
+        }
+
+    # Load ingested data
+    data_path = sessions_dir / session_id / "data" / "raw" / "ingested.csv"
+    if not data_path.exists():
+        return {
+            "stage":                 "validation",
+            "status":                "failed",
+            "plain_english_summary": "No ingested data found. Please run the ingestion stage first."
+        }
+
+    df = pd.read_csv(data_path, low_memory=False)
+
+    # Drop rows where target is missing (for validation purposes)
+    if target_col in df.columns:
+        df_for_validation = df.dropna(subset=[target_col])
+    else:
+        df_for_validation = df
+
+    report       = _run_validation(df_for_validation, target_col, task_type)
+    hard_stops   = report["hard_stops"]
+    warnings     = report["warnings"]
+    advisories   = report["advisories"]
+    overall      = report["overall_status"]
+
+    # Build decisions_required from warnings that need user input
+    decisions_required = []
+    for w in warnings + advisories:
+        if w["check"] == "class_imbalance":
+            minority_pct = w.get("minority_pct", 0)
+            minority_cls = w.get("minority_cls", "minority")
+            majority_cls = w.get("majority_cls", "majority")
+            # Recommend class weights for mild, oversample for severe
+            rec = "class_weights" if minority_pct >= 0.05 else "oversample"
+            decisions_required.append({
+                "id":       "imbalance_strategy",
+                "question": w["message"],
+                "recommendation": rec,
+                "recommendation_reason": (
+                    "Class weights tell the model to treat each '{minority_cls}' example as more important, "
+                    "without changing the data itself. It is the safest option."
+                    if rec == "class_weights" else
+                    f"With only {minority_pct:.1%} '{minority_cls}' rows, class weights alone may not be enough. "
+                    f"Oversampling duplicates minority rows so the model sees a more balanced picture during training."
+                ).replace("'{minority_cls}'", f"'{minority_cls}'"),
+                "alternatives": [
+                    {
+                        "id":       "class_weights",
+                        "label":    "Adjust class weights (recommended for mild imbalance)",
+                        "tradeoff": f"Tells the model to penalise mistakes on '{minority_cls}' more heavily. No data is added or removed.",
+                    },
+                    {
+                        "id":       "oversample",
+                        "label":    f"Oversample — duplicate '{minority_cls}' rows",
+                        "tradeoff": f"Copies minority rows until classes are balanced. Effective but can overfit if the dataset is small.",
+                    },
+                    {
+                        "id":       "undersample",
+                        "label":    f"Undersample — remove '{majority_cls}' rows",
+                        "tradeoff": f"Randomly removes majority rows to match the minority count. Balanced, but you lose data.",
+                    },
+                    {
+                        "id":       "none",
+                        "label":    "Do nothing",
+                        "tradeoff": "The model may learn to always predict the majority class. Only choose this if you have a specific reason.",
+                    },
+                ]
+            })
+    for w in warnings:
+        if w["check"] == "duplicates":
+            decisions_required.append({
+                "id":                   "handle_duplicates",
+                "question":             w["message"],
+                "recommendation":       "remove",
+                "recommendation_reason": "Duplicate rows add no information and can bias the model.",
+                "alternatives": [
+                    {"id": "remove", "label": "Remove duplicate rows (recommended)", "tradeoff": "Cleaner data, slightly fewer rows."},
+                    {"id": "keep",   "label": "Keep all rows",                        "tradeoff": "No data lost but duplicates may bias results."}
+                ]
+            })
+        elif w["check"] == "missing_values" and w.get("missing_pct", 0) > 0.8:
+            decisions_required.append({
+                "id":                   f"drop_col_{w['column']}",
+                "question":             w["message"],
+                "recommendation":       "drop",
+                "recommendation_reason": "Columns that are mostly empty are unlikely to be useful.",
+                "alternatives": [
+                    {"id": "drop", "label": "Remove this column (recommended)", "tradeoff": "Removes an uninformative column."},
+                    {"id": "keep", "label": "Keep it for now",                  "tradeoff": "Imputation will be attempted during cleaning."}
+                ]
+            })
+
+    # Plain English summary
+    if overall == "hard_stop":
+        summary = (
+            "Before we can continue, there is something that needs your attention: "
+            + hard_stops[0]["message"]
+        )
+    elif overall == "warnings":
+        summary = (
+            f"Your data passed the critical checks. "
+            f"We found {len(warnings)} thing(s) worth your attention before we continue."
+        )
+    else:
+        summary = (
+            f"Great news — your data passed all {report['total_checks_run']} quality checks. "
+            f"Everything looks good to proceed."
+        )
+
+    class_imbalance = any(
+        r["check"] == "class_imbalance" and r["severity"] in ("warning", "advisory")
+        for r in hard_stops + warnings + advisories
+    )
+
+    return {
+        "stage":                "validation",
+        "status":               overall,
+        "output_data_path":     str(data_path),
+        "validation_report":    report,
+        "decisions_required":   decisions_required,
+        "decisions_made":       [],
+        "plain_english_summary": summary,
+        "report_section": {
+            "stage":   "validation",
+            "title":   "Checking Your Data Quality",
+            "summary": f"We ran {report['total_checks_run']} checks on your data. {summary}",
+            "decision_made": (
+                f"{len(warnings)} items flagged for your review."
+                if warnings else "No decisions required — data passed all checks."
+            ),
+            "alternatives_considered": None,
+            "why_this_matters": (
+                "Catching data quality issues early means the model learns from reliable "
+                "information rather than noise."
+            )
+        },
+        "config_updates": {
+            "validation_passed":        overall != "hard_stop",
+            "class_imbalance_detected": class_imbalance,
+            "imbalance_strategy":       decisions.get("imbalance_strategy", None),
+        }
+    }

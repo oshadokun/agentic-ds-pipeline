@@ -1,0 +1,175 @@
+/* Import fonts */
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* -----------------------------------------------------------------------
+   Design tokens
+   ----------------------------------------------------------------------- */
+:root {
+  /* Primary — deep, trustworthy blue */
+  --colour-primary:         #1B3A5C;
+  --colour-primary-light:   #2E6099;
+  --colour-primary-pale:    #EBF3FB;
+
+  /* Accent — warm amber for actions and highlights */
+  --colour-accent:          #D97706;
+  --colour-accent-light:    #FEF3C7;
+
+  /* Status colours */
+  --colour-success:         #065F46;
+  --colour-success-bg:      #ECFDF5;
+  --colour-warning:         #92400E;
+  --colour-warning-bg:      #FFFBEB;
+  --colour-error:           #991B1B;
+  --colour-error-bg:        #FEF2F2;
+
+  /* Neutrals */
+  --colour-text-primary:    #111827;
+  --colour-text-secondary:  #6B7280;
+  --colour-text-muted:      #9CA3AF;
+  --colour-border:          #E5E7EB;
+  --colour-surface:         #F9FAFB;
+  --colour-white:           #FFFFFF;
+
+  /* Stage states */
+  --colour-stage-complete:  #065F46;
+  --colour-stage-active:    #1B3A5C;
+  --colour-stage-pending:   #9CA3AF;
+
+  /* Typography */
+  --font-heading: 'DM Serif Display', Georgia, serif;
+  --font-body:    'DM Sans', system-ui, sans-serif;
+  --font-mono:    'JetBrains Mono', 'Courier New', monospace;
+
+  /* Shadows */
+  --shadow-sm:  0 1px 3px rgba(0,0,0,0.08);
+  --shadow-md:  0 4px 16px rgba(0,0,0,0.08);
+  --shadow-lg:  0 8px 32px rgba(0,0,0,0.12);
+}
+
+/* -----------------------------------------------------------------------
+   Base resets and defaults
+   ----------------------------------------------------------------------- */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--colour-text-primary);
+  background-color: var(--colour-surface);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  line-height: 1.2;
+  color: var(--colour-text-primary);
+}
+
+/* -----------------------------------------------------------------------
+   Utility classes not covered by Tailwind
+   ----------------------------------------------------------------------- */
+.font-serif {
+  font-family: var(--font-heading) !important;
+}
+
+.font-mono {
+  font-family: var(--font-mono) !important;
+}
+
+/* Smooth transitions for interactive elements */
+button, a, [role="button"] {
+  transition-property: color, background-color, border-color, box-shadow, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+/* Focus ring — accessible, consistent */
+:focus-visible {
+  outline: 2px solid #3B82F6;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Scrollbar styling — subtle */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #D1D5DB;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #9CA3AF;
+}
+
+/* -----------------------------------------------------------------------
+   Animation utilities
+   ----------------------------------------------------------------------- */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+
+.animate-fade-in    { animation: fadeIn  0.3s ease-out; }
+.animate-slide-up   { animation: slideUp 0.3s ease-out; }
+.animate-slide-down { animation: slideDown 0.3s ease-out; }
+.animate-scale-in   { animation: scaleIn  0.2s ease-out; }
+
+/* -----------------------------------------------------------------------
+   Print styles — report generation
+   ----------------------------------------------------------------------- */
+@media print {
+  .no-print { display: none !important; }
+
+  body {
+    background: white;
+    color: black;
+    font-size: 12pt;
+  }
+
+  h1 { font-size: 22pt; }
+  h2 { font-size: 16pt; }
+  h3 { font-size: 13pt; }
+}
