@@ -209,14 +209,15 @@ def _expand_datetime(df: pd.DataFrame, col: str) -> tuple[pd.DataFrame, str]:
     df[f"{col}_dayofweek"]  = dt.dt.dayofweek
     df[f"{col}_is_weekend"] = (dt.dt.dayofweek >= 5).astype(int)
     df[f"{col}_quarter"]    = dt.dt.quarter
+    df[f"{col}_week"]       = dt.dt.isocalendar().week.astype(int)
     df[f"{col}_month_sin"]  = np.sin(2 * np.pi * dt.dt.month / 12)
     df[f"{col}_month_cos"]  = np.cos(2 * np.pi * dt.dt.month / 12)
     df[f"{col}_dow_sin"]    = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
     df[f"{col}_dow_cos"]    = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
     df = df.drop(columns=[col])
     return df, (
-        f"Expanded '{col}' into 10 date-based features: "
-        f"year, month, day, day of week, weekend flag, quarter, "
+        f"Expanded '{col}' into 11 date-based features: "
+        f"year, month, day, day of week, weekend flag, quarter, week number, "
         f"and cyclical encodings for month and day of week."
     )
 
@@ -293,6 +294,73 @@ def _select_features(df: pd.DataFrame, target_col: str,
     )
 
     return selected + [target_col], importance_df, msg
+
+
+# ---------------------------------------------------------------------------
+# Lag features (time series)
+# ---------------------------------------------------------------------------
+
+def _build_lag_decision(df: pd.DataFrame, target_col: str) -> dict | None:
+    """Return a decisions_required entry for lag feature creation, or None."""
+    numeric_cols = [
+        c for c in df.select_dtypes("number").columns
+        if c != target_col
+    ]
+    if not numeric_cols:
+        return None
+    return {
+        "id":       "lag_features",
+        "type":     "lag_features",
+        "question": (
+            "Would you like to create lag features? A lag feature takes the value of a column "
+            "from a previous row — for example, 'what was the volume 7 days ago?' This gives the "
+            "model memory of past values, which is often very useful for time series prediction."
+        ),
+        "recommendation":        "yes",
+        "recommendation_reason": (
+            "Lag features are one of the most powerful tools for time series models. "
+            "They let the model learn from recent history, not just the current snapshot."
+        ),
+        "available_columns": numeric_cols,
+        "lag_options": [
+            {"id": 1,  "label": "1 period back",  "tradeoff": "Captures the most recent previous value."},
+            {"id": 3,  "label": "3 periods back",  "tradeoff": "Short-term trend context."},
+            {"id": 7,  "label": "7 periods back",  "tradeoff": "Weekly pattern (if daily data)."},
+            {"id": 14, "label": "14 periods back", "tradeoff": "Fortnightly pattern."},
+            {"id": 30, "label": "30 periods back", "tradeoff": "Monthly pattern (if daily data)."},
+        ],
+        "alternatives": [
+            {"id": "yes", "label": "Yes — create lag features",   "tradeoff": "Rows at the start of the data will lose some lag values and be dropped."},
+            {"id": "no",  "label": "No — skip lag features",       "tradeoff": "The model only sees the current row, not recent history."},
+        ]
+    }
+
+
+def _apply_lags(df: pd.DataFrame, cols: list, lags: list, target_col: str) -> tuple[pd.DataFrame, list]:
+    """Create lag columns for the specified columns and lag periods."""
+    actions = []
+    for col in cols:
+        if col not in df.columns:
+            continue
+        for lag in lags:
+            lag_col = f"{col}_lag_{lag}"
+            df[lag_col] = df[col].shift(lag)
+            actions.append(f"Created '{lag_col}' — value of '{col}' from {lag} row(s) ago.")
+
+    # Drop rows that now have NaN lags (the first N rows)
+    before = len(df)
+    df = df.dropna(subset=[
+        f"{col}_lag_{lag}"
+        for col in cols if col in df.columns
+        for lag in lags
+        if f"{col}_lag_{lag}" in df.columns
+    ]).reset_index(drop=True)
+    dropped = before - len(df)
+    if dropped:
+        actions.append(
+            f"Removed {dropped} row(s) from the start of the data that had no lag history yet."
+        )
+    return df, actions
 
 
 # ---------------------------------------------------------------------------
@@ -403,25 +471,38 @@ def run(session: dict, decisions: dict) -> dict:
                     .get("high_corr_pairs", [])
         )
 
+    is_time_series = (
+        "time_series" in task_type or "forecast" in task_type
+        or session.get("config", {}).get("is_time_series", False)
+    )
+
     # Phase 1: return decisions_required if no user decisions yet
     if not decisions or decisions.get("phase") == "request_decisions":
         dr = _build_decisions_required(df, target_col)
+        # For time series, also ask about lag features
+        if is_time_series:
+            lag_dec = _build_lag_decision(df, target_col)
+            if lag_dec:
+                dr.append(lag_dec)
         if dr:
+            cat_count = sum(1 for d in dr if d.get("type") == "encoding")
+            has_lag   = any(d.get("type") == "lag_features" for d in dr)
+            parts = []
+            if cat_count:
+                parts.append(f"{cat_count} text or category column(s) need converting to numbers")
+            if has_lag:
+                parts.append("you can optionally add lag features for time series prediction")
+            summary = "We found some decisions to make before engineering features: " + "; ".join(parts) + "."
             return {
                 "stage":              "feature_engineering",
                 "status":             "decisions_required",
                 "decisions_required": dr,
-                "plain_english_summary": (
-                    f"Your data contains {len(dr)} text or category column(s). "
-                    f"The model cannot use text directly — we need to convert them to numbers. "
-                    f"Here is what we recommend for each:"
-                )
+                "plain_english_summary": summary,
             }
-        # No categorical columns — fall through to apply transformations directly
+        # No decisions needed — fall through to apply transformations directly
 
     # Phase 2: apply transformations
     actions_log = []
-    is_time_series = "time_series" in task_type or "forecast" in task_type
 
     # 1. Remove redundant correlated features
     df, redundant_actions = _remove_redundant(df, target_col, high_corr_pairs)
@@ -453,7 +534,18 @@ def run(session: dict, decisions: dict) -> dict:
             f"Data sorted chronologically by '{date_cols_expanded[0]}' to preserve time order."
         )
 
-    # 3. Encode categoricals using user decisions
+    # 3. Apply lag features (time series only, if user opted in)
+    if is_time_series and decisions.get("lag_features") == "yes":
+        lag_cols = decisions.get("lag_columns", [])
+        lag_periods = decisions.get("lag_periods", [1, 7])
+        # Default: lag the target column if no columns specified
+        if not lag_cols:
+            lag_cols = [target_col] if target_col in df.columns else []
+        if lag_cols and lag_periods:
+            df, lag_actions = _apply_lags(df, lag_cols, lag_periods, target_col)
+            actions_log.extend(lag_actions)
+
+    # 4. Encode categoricals using user decisions
     cat_cols = [c for c in df.select_dtypes("object").columns if c != target_col]
     encoding_strategies = {}
     for col in cat_cols:
@@ -477,7 +569,7 @@ def run(session: dict, decisions: dict) -> dict:
                 c for c in df.columns
                 if any(c.endswith(suf) for suf in
                        ("_year", "_month", "_day", "_dayofweek", "_is_weekend",
-                        "_quarter", "_month_sin", "_month_cos", "_dow_sin", "_dow_cos"))
+                        "_quarter", "_week", "_month_sin", "_month_cos", "_dow_sin", "_dow_cos"))
             ]
             for dc in date_derived:
                 if dc not in available:
@@ -521,6 +613,8 @@ def run(session: dict, decisions: dict) -> dict:
         "config_updates": {
             "feature_columns":    feature_cols,
             "encoding_strategies": encoding_strategies,
-            "features_selected":  len(feature_cols)
+            "features_selected":  len(feature_cols),
+            "features_dropped":   max(0, len(df.columns) - 1 - len(feature_cols)),
+            "has_date_column":    bool(date_cols_expanded),
         }
     }

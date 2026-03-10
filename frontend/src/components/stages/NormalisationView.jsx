@@ -26,11 +26,15 @@ export default function NormalisationView() {
 
   useEffect(() => {
     async function load() {
+      let res
       if (isComplete) {
-        await loadStageResult("normalisation")
+        res = await loadStageResult("normalisation")
       } else {
-        await runStage("normalisation")
+        res = await runStage("normalisation")
       }
+      console.log("[NormalisationView] stage result:", res)
+      console.log("[NormalisationView] decisions_required:", res?.decisions_required)
+      console.log("[NormalisationView] recommendation:", res?.decisions_required?.[0]?.recommendation)
       setHasLoaded(true)
     }
     load()
@@ -77,7 +81,7 @@ export default function NormalisationView() {
 
           {required.map(d => (
             <DecisionCard
-              key={d.id}
+              key={`${d.id}-${d.recommendation}`}
               decision={d}
               onConfirm={handleConfirm}
             />

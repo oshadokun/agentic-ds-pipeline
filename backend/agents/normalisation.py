@@ -18,6 +18,11 @@ from sklearn.preprocessing import (
 )
 
 
+# Task types that never need scaling
+TASK_TYPES_NOT_REQUIRING_SCALING = [
+    "time_series", "forecast", "time_series_forecast",
+]
+
 SCALING_STRATEGIES = {
     "standard": {
         "label":     "Standard scaling — centre around zero with consistent spread (recommended default)",
@@ -46,13 +51,6 @@ SCALING_STRATEGIES = {
     }
 }
 
-MODELS_NOT_REQUIRING_SCALING = [
-    "random_forest", "random_forest_regressor",
-    "xgboost", "xgboost_regressor",
-    "decision_tree", "gradient_boosting"
-]
-
-
 def _make_scaler(strategy: str):
     return {
         "standard": StandardScaler(),
@@ -63,9 +61,22 @@ def _make_scaler(strategy: str):
     }.get(strategy)
 
 
-def _recommend_strategy(df: pd.DataFrame, numeric_cols: list, model_type: str = None) -> tuple[str, str]:
-    if model_type in MODELS_NOT_REQUIRING_SCALING:
-        return "none", "The model you are using handles different scales natively — scaling is not required."
+def _recommend_strategy(df: pd.DataFrame, numeric_cols: list, task_type: str = "") -> tuple:
+    """Return (strategy_key, reason_string). Never raises — falls back to standard scaling."""
+    task_type = (task_type or "").lower()
+
+    # --- Task-type rules (take priority over data-driven heuristics) ---
+    if any(t in task_type for t in TASK_TYPES_NOT_REQUIRING_SCALING):
+        return (
+            "none",
+            "Time series models (ARIMA, Prophet) work directly on raw values. "
+            "Scaling the data would make error metrics like MAE uninterpretable — "
+            "they would no longer correspond to real units."
+        )
+
+    # --- Data-driven heuristics for classification / regression ---
+    if not numeric_cols:
+        return "standard", "Standard scaling is the most widely used approach."
 
     outlier_cols = []
     skewed_cols  = []
@@ -141,7 +152,7 @@ def _plot_comparison(before: pd.DataFrame, after: pd.DataFrame,
 def run(session: dict, decisions: dict) -> dict:
     session_id   = session["session_id"]
     target_col   = session["goal"].get("target_column")
-    model_type   = session["config"].get("model_id")
+    task_type    = session["goal"].get("task_type", "")
     sessions_dir = Path("sessions")
     session_dir  = sessions_dir / session_id
 
@@ -163,7 +174,20 @@ def run(session: dict, decisions: dict) -> dict:
 
     # Return decision options if not yet provided
     if not decisions or decisions.get("phase") == "request_decisions":
-        rec, reason = _recommend_strategy(df, numeric_cols, model_type)
+        try:
+            rec, reason = _recommend_strategy(df, numeric_cols, task_type)
+        except Exception:
+            rec, reason = "standard", "Standard scaling is the most widely used approach and works well for most data."
+        if rec == "none":
+            intro = (
+                "Based on your goal type, scaling is not required for this pipeline. "
+                "You can still choose a different approach below if you prefer."
+            )
+        else:
+            intro = (
+                "Some of your columns have very different value ranges. We need to put them on "
+                "a comparable scale so the model treats them fairly. Here is what we recommend:"
+            )
         return {
             "stage":  "normalisation",
             "status": "decisions_required",
@@ -177,10 +201,7 @@ def run(session: dict, decisions: dict) -> dict:
                     for k, v in SCALING_STRATEGIES.items()
                 ]
             }],
-            "plain_english_summary": (
-                "Some of your columns have very different value ranges. We need to put them on "
-                "a comparable scale so the model treats them fairly. Here is what we recommend:"
-            )
+            "plain_english_summary": intro
         }
 
     strategy = decisions.get("scaling_strategy", "standard")

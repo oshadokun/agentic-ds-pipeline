@@ -12,8 +12,91 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.utils import resample
 from sklearn.utils.class_weight import compute_class_weight
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_number(n: float) -> str:
+    """Format a number for user-facing messages — never scientific notation."""
+    abs_n = abs(n)
+    if abs_n >= 1_000_000:
+        return f"{n / 1_000_000:.1f} million"
+    if abs_n >= 1_000:
+        return f"{n:,.0f}"
+    if abs_n >= 1:
+        return f"{n:.2f}"
+    return f"{n:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Time series model wrappers (sklearn-compatible interface)
+# ---------------------------------------------------------------------------
+
+class ARIMAWrapper:
+    """Wraps statsmodels ARIMA as a sklearn-compatible estimator."""
+
+    def __init__(self, order=(1, 1, 1)):
+        self.order = order
+        self._model_fit = None
+
+    def fit(self, X, y):
+        from statsmodels.tsa.arima.model import ARIMA
+        y_vals = y.values if hasattr(y, "values") else np.array(y)
+        model = ARIMA(y_vals, order=self.order)
+        self._model_fit = model.fit()
+        self._n_train = len(y_vals)
+        return self
+
+    def predict(self, X):
+        n = len(X)
+        forecast = self._model_fit.forecast(steps=n)
+        return np.array(forecast)
+
+    def score(self, X, y):
+        y_pred = self.predict(X)
+        return float(r2_score(y, y_pred))
+
+
+class ProphetWrapper:
+    """Wraps Facebook Prophet as a sklearn-compatible estimator."""
+
+    def __init__(self):
+        self._model = None
+        self._last_date = None
+
+    def fit(self, X, y):
+        from prophet import Prophet
+        y_vals = y.values if hasattr(y, "values") else np.array(y)
+        n = len(y_vals)
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        df = pd.DataFrame({"ds": dates, "y": y_vals})
+        self._model = Prophet(
+            daily_seasonality=False,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            changepoint_prior_scale=0.05
+        )
+        self._model.fit(df)
+        self._last_date = dates[-1]
+        return self
+
+    def predict(self, X):
+        n = len(X)
+        future_dates = pd.date_range(
+            self._last_date + pd.Timedelta(days=1), periods=n, freq="D"
+        )
+        future = pd.DataFrame({"ds": future_dates})
+        forecast = self._model.predict(future)
+        return forecast["yhat"].values
+
+    def score(self, X, y):
+        y_pred = self.predict(X)
+        return float(r2_score(y, y_pred))
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +145,10 @@ def _make_model(model_id: str, class_weights):
             reg_alpha=0.1, reg_lambda=1.0, subsample=0.8,
             random_state=42, verbosity=0
         )
+    elif model_id == "arima":
+        return ARIMAWrapper(order=(1, 1, 1))
+    elif model_id == "prophet":
+        return ProphetWrapper()
     raise ValueError(f"Unknown model_id: {model_id}")
 
 
@@ -145,11 +232,31 @@ def _recommend_models(task_type: str, n_rows: int,
 
     elif "time_series" in task_type or "forecast" in task_type:
         recs.append({
+            "id":       "arima",
+            "name":     "ARIMA",
+            "role":     "baseline",
+            "reason":   "Classic statistical model for time series. Learns trends and autocorrelation directly from the sequence of values.",
+            "tradeoff": "Works on the target sequence only — does not use other feature columns.",
+            "interpretable": True
+        })
+        try:
+            import prophet  # noqa: F401
+            recs.append({
+                "id":       "prophet",
+                "name":     "Prophet",
+                "role":     "strong_candidate",
+                "reason":   "Handles trend, seasonality, and holidays automatically. Robust to missing data.",
+                "tradeoff": "Works on the target sequence only. Slower to train than regression models.",
+                "interpretable": True
+            })
+        except ImportError:
+            pass
+        recs.append({
             "id":       "ridge",
             "name":     "Ridge Regression",
-            "role":     "baseline",
-            "reason":   "Fast and interpretable baseline for time series forecasting.",
-            "tradeoff": "Assumes linear relationships — may miss seasonal or trend patterns.",
+            "role":     "strong_candidate",
+            "reason":   "Fast and interpretable. Uses all engineered features including month, day of week, and lag columns.",
+            "tradeoff": "Assumes linear relationships — may miss complex seasonal patterns.",
             "interpretable": True
         })
         if n_rows > 500:
@@ -157,7 +264,7 @@ def _recommend_models(task_type: str, n_rows: int,
                 "id":       "random_forest_regressor",
                 "name":     "Random Forest",
                 "role":     "strong_candidate",
-                "reason":   "Captures non-linear patterns in time-based features (month, day of week, etc.).",
+                "reason":   "Captures non-linear patterns in time-based features (month, day of week, lag columns).",
                 "tradeoff": "Cannot extrapolate beyond the range seen in training data.",
                 "interpretable": False
             })
@@ -197,19 +304,15 @@ def _get_class_weights(y_train, task_type: str):
     return None, "Your classes are reasonably balanced — no adjustment needed."
 
 
-def _apply_oversample(X_train: pd.DataFrame, y_train: pd.Series):
-    """Upsample minority class(es) to match the majority class count."""
-    combined = X_train.copy()
-    combined["__target__"] = y_train.values
-    majority_count = combined["__target__"].value_counts().max()
-    parts = []
-    for cls, grp in combined.groupby("__target__"):
-        if len(grp) < majority_count:
-            grp = resample(grp, replace=True, n_samples=majority_count, random_state=42)
-        parts.append(grp)
-    combined = pd.concat(parts).sample(frac=1, random_state=42).reset_index(drop=True)
-    y_out = combined.pop("__target__")
-    return combined, y_out
+def _apply_smote(X_train: pd.DataFrame, y_train: pd.Series):
+    """Apply SMOTE to generate synthetic minority-class examples."""
+    from imblearn.over_sampling import SMOTE
+    # k_neighbors must be < minority class count
+    min_count = y_train.value_counts().min()
+    k = min(5, max(1, min_count - 1))
+    sm = SMOTE(k_neighbors=k, random_state=42)
+    X_res, y_res = sm.fit_resample(X_train, y_train)
+    return pd.DataFrame(X_res, columns=X_train.columns), pd.Series(y_res, name=y_train.name)
 
 
 def _apply_undersample(X_train: pd.DataFrame, y_train: pd.Series):
@@ -304,6 +407,9 @@ def run(session: dict, decisions: dict) -> dict:
     n_rows  = len(X_train)
     n_feats = X_train.shape[1]
     interp  = decisions.get("interpretability_needed", False)
+    # Treat as time series if either the task_type says so or the config flag was set by validation
+    if session.get("config", {}).get("is_time_series", False) and "time_series" not in task_type:
+        task_type = "time_series"
     recs    = _recommend_models(task_type, n_rows, interp)
 
     # Return model choices if not yet made
@@ -349,10 +455,11 @@ def run(session: dict, decisions: dict) -> dict:
             if class_weights:
                 actions_log.append(cw_msg)
 
-        elif imbalance_strategy == "oversample":
-            X_train, y_train = _apply_oversample(X_train, y_train)
+        elif imbalance_strategy == "smote":
+            X_train, y_train = _apply_smote(X_train, y_train)
             actions_log.append(
-                f"Oversampled minority class — training set is now {len(y_train)} rows, balanced across classes."
+                f"Applied SMOTE — created synthetic minority-class examples. "
+                f"Training set is now {len(y_train)} rows, balanced across classes."
             )
 
         elif imbalance_strategy == "undersample":
@@ -380,33 +487,66 @@ def run(session: dict, decisions: dict) -> dict:
             "plain_english_summary": f"Training failed: {str(exc)}"
         }
 
-    overfit = _detect_overfitting(train_s, val_s)
-    actions_log.append(overfit["plain_english"])
+    model_display_name = next(
+        (r["name"] for r in recs if r["id"] == model_id),
+        model_id.replace("_", " ").title()
+    )
+
+    is_ts_model = model_id in ("arima", "prophet")
+
+    if is_ts_model:
+        # For ARIMA/Prophet use MAE and RMSE on both train and val — never mix R² and MAE
+        y_pred_train = model.predict(X_train)
+        y_pred_val   = model.predict(X_val)
+        mae_train    = float(mean_absolute_error(y_train, y_pred_train))
+        mae_val      = float(mean_absolute_error(y_val,   y_pred_val))
+        rmse_val     = float(np.sqrt(mean_squared_error(y_val, y_pred_val)))
+        metric_name       = "MAE"
+        metric_value      = round(mae_val, 4)
+        train_score_display = round(mae_train, 4)
+        val_score_display   = round(mae_val, 4)
+        overfitting_detected = False
+        summary = (
+            f"We trained a {model_display_name} model on your data. "
+            f"On average, its predictions are off by {_fmt_number(mae_val)} "
+            f"(RMSE: {_fmt_number(rmse_val)}). "
+            f"We'll try to improve this in the tuning step."
+        )
+    else:
+        overfit = _detect_overfitting(train_s, val_s)
+        actions_log.append(overfit["plain_english"])
+        metric_name         = "Accuracy" if "classification" in task_type else "R²"
+        metric_value        = round(val_s, 4)
+        train_score_display = round(train_s, 4)
+        val_score_display   = round(val_s, 4)
+        overfitting_detected = overfit["overfitting_detected"]
+        summary = (
+            f"We trained a {model_display_name} model on your data. "
+            + overfit["plain_english"]
+        )
 
     # Save best model reference
     best_model_info = {
-        "model_id":   model_id,
-        "model_path": model_path,
-        "val_score":  round(val_s, 4)
+        "model_id":    model_id,
+        "model_path":  model_path,
+        "val_score":   val_score_display,
+        "metric_name": metric_name,
     }
     models_dir = session_dir / "models"
     with open(models_dir / "best_model.json", "w") as f:
         json.dump(best_model_info, f)
 
-    summary = (
-        f"We trained a {model_id.replace('_', ' ').title()} model on your data. "
-        f"It correctly predicted {val_s:.1%} of outcomes on the validation data it had not seen during training. "
-        + overfit["plain_english"]
-    )
-
     return {
         "stage":                  "training",
         "status":                 "success",
         "model_id":               model_id,
+        "model_type":             model_display_name,
+        "metric_name":            metric_name,
+        "metric_value":           metric_value,
         "model_path":             model_path,
-        "train_score":            round(train_s, 4),
-        "val_score":              round(val_s, 4),
-        "overfitting_detected":   overfit["overfitting_detected"],
+        "train_score":            train_score_display,
+        "val_score":              val_score_display,
+        "overfitting_detected":   overfitting_detected,
         "class_weights_applied":  class_weights is not None,
         "decisions_required":     [],
         "decisions_made":         [{"decision": "model_selection", "chosen": model_id}],

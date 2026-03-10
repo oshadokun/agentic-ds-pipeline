@@ -8,6 +8,127 @@ import ExplanationPanel from "../shared/ExplanationPanel"
 import DecisionCard from "../shared/DecisionCard"
 import FeatureImportanceChart from "../charts/FeatureImportanceChart"
 
+function LagFeatureCard({ decision, onConfirm }) {
+  const [choice, setChoice]       = useState("yes")
+  const [selCols, setSelCols]     = useState([])
+  const [selLags, setSelLags]     = useState([])
+  const [submitted, setSubmitted] = useState(false)
+
+  function toggleCol(col) {
+    setSelCols(prev => prev.includes(col) ? prev.filter(c => c !== col) : [...prev, col])
+  }
+  function toggleLag(lag) {
+    setSelLags(prev => prev.includes(lag) ? prev.filter(l => l !== lag) : [...prev, lag])
+  }
+  function handleConfirm() {
+    onConfirm("lag_features", choice)
+    if (choice === "yes") {
+      onConfirm("lag_columns", selCols)
+      onConfirm("lag_periods", selLags)
+    }
+    setSubmitted(true)
+  }
+
+  const canConfirm = choice === "no" || (selCols.length > 0 && selLags.length > 0)
+
+  return (
+    <div className="border border-gray-200 rounded-2xl p-5 bg-white shadow-sm space-y-4">
+      <div>
+        <p className="text-sm font-semibold text-gray-800 mb-1">Lag Features</p>
+        <p className="text-sm text-gray-500">{decision.question}</p>
+      </div>
+
+      {/* Yes / No */}
+      <div className="flex gap-3">
+        {decision.alternatives.map(alt => (
+          <button
+            key={alt.id}
+            onClick={() => !submitted && setChoice(alt.id)}
+            className={`flex-1 py-2 rounded-xl border text-sm font-medium transition-colors
+              ${choice === alt.id
+                ? "border-[#1B3A5C] bg-[#1B3A5C] text-white"
+                : "border-gray-200 text-gray-600 hover:bg-gray-50"}`}
+          >
+            {alt.label}
+          </button>
+        ))}
+      </div>
+
+      {choice === "yes" && !submitted && (
+        <>
+          {/* Column selection */}
+          <div>
+            <p className="text-xs font-semibold text-gray-600 mb-2 uppercase tracking-wide">
+              Which columns to lag?
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {decision.available_columns.map(col => (
+                <button
+                  key={col}
+                  onClick={() => toggleCol(col)}
+                  className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors
+                    ${selCols.includes(col)
+                      ? "border-[#1B3A5C] bg-[#1B3A5C] text-white"
+                      : "border-gray-200 text-gray-600 hover:bg-gray-50"}`}
+                >
+                  {col}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Lag period selection — multi-select */}
+          <div>
+            <p className="text-xs font-semibold text-gray-600 mb-1 uppercase tracking-wide">
+              How many periods back?
+            </p>
+            <p className="text-xs text-gray-400 mb-2">You can select more than one.</p>
+            <div className="flex flex-wrap gap-2">
+              {decision.lag_options.map(opt => (
+                <button
+                  key={opt.id}
+                  onClick={() => toggleLag(opt.id)}
+                  title={opt.tradeoff}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors
+                    ${selLags.includes(opt.id)
+                      ? "border-[#1B3A5C] bg-[#1B3A5C] text-white"
+                      : "border-gray-200 text-gray-600 hover:bg-gray-50"}`}
+                >
+                  <span className={`w-3 h-3 rounded-sm border flex items-center justify-center flex-shrink-0 ${
+                    selLags.includes(opt.id) ? "border-white bg-white" : "border-gray-400"
+                  }`}>
+                    {selLags.includes(opt.id) && (
+                      <span className="block w-1.5 h-1.5 rounded-sm bg-[#1B3A5C]" />
+                    )}
+                  </span>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+
+      {!submitted ? (
+        <button
+          onClick={handleConfirm}
+          disabled={!canConfirm}
+          className="w-full py-2 rounded-xl bg-[#1B3A5C] text-white text-sm font-medium
+                     hover:bg-[#162f4d] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Confirm
+        </button>
+      ) : (
+        <p className="text-xs text-green-600 font-medium">
+          ✓ {choice === "yes"
+            ? `Will create lags for ${selCols.join(", ")} at periods ${selLags.join(", ")}`
+            : "Skipping lag features"}
+        </p>
+      )}
+    </div>
+  )
+}
+
 export default function FeatureEngineeringView() {
   const { sessionId } = useSession()
   const {
@@ -79,13 +200,11 @@ export default function FeatureEngineeringView() {
               `Your data contains text or category columns. The model can't use text directly — we need to convert them to numbers. Here is what we recommend for each:`}
           />
 
-          {required.map(d => (
-            <DecisionCard
-              key={d.id}
-              decision={d}
-              onConfirm={handleConfirm}
-            />
-          ))}
+          {required.map(d =>
+            d.type === "lag_features"
+              ? <LagFeatureCard key={d.id} decision={d} onConfirm={handleConfirm} />
+              : <DecisionCard   key={d.id} decision={d} onConfirm={handleConfirm} />
+          )}
 
           {allConfirmed && (
             <button

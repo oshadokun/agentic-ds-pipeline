@@ -156,8 +156,9 @@ export default function TrainingView() {
             ))}
           </div>
 
-          {/* Overfitting warning */}
+          {/* Overfitting warning — only meaningful for accuracy/R² metrics, not MAE/RMSE */}
           {result.train_score && result.val_score &&
+           result.metric_name !== "MAE" && result.metric_name !== "RMSE" &&
            (result.train_score - result.val_score) > 0.1 && (
             <AlertBanner
               type="warning"

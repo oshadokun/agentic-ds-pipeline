@@ -141,25 +141,33 @@ export default function SplittingView() {
           )}
 
           <div className="border border-gray-100 rounded-2xl p-5 bg-white shadow-sm">
-            <SplitRatioDiagram
-              defaultRatios={{
-                train: result.train_pct ?? 70,
-                val:   result.val_pct   ?? 15,
-                test:  result.test_pct  ?? 15
-              }}
-              totalRows={result.total_rows}
-              disabled
-            />
+            {(() => {
+              const sizes = result.split_sizes ?? {}
+              const total = (sizes.train ?? 0) + (sizes.val ?? 0) + (sizes.test ?? 0)
+              return (
+                <SplitRatioDiagram
+                  defaultRatios={{
+                    train: total ? Math.round((sizes.train ?? 0) / total * 100) : 70,
+                    val:   total ? Math.round((sizes.val   ?? 0) / total * 100) : 15,
+                    test:  total ? Math.round((sizes.test  ?? 0) / total * 100) : 15,
+                  }}
+                  totalRows={total || result.total_rows}
+                  disabled
+                />
+              )
+            })()}
           </div>
 
           <div className="grid grid-cols-3 gap-3">
             {[
-              { label: "Train rows", value: result.train_rows?.toLocaleString() },
-              { label: "Val rows",   value: result.val_rows?.toLocaleString() },
-              { label: "Test rows",  value: result.test_rows?.toLocaleString() }
+              { label: "Train rows", value: result.split_sizes?.train },
+              { label: "Val rows",   value: result.split_sizes?.val },
+              { label: "Test rows",  value: result.split_sizes?.test }
             ].map(({ label, value }) => (
               <div key={label} className="bg-gray-50 rounded-xl p-3 text-center">
-                <p className="text-lg font-semibold text-gray-800">{value ?? "—"}</p>
+                <p className="text-lg font-semibold text-gray-800">
+                  {value != null ? value.toLocaleString() : "—"}
+                </p>
                 <p className="text-xs text-gray-400 mt-0.5">{label}</p>
               </div>
             ))}

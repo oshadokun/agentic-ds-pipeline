@@ -7,6 +7,7 @@ import StageNavigation from "../shell/StageNavigation"
 import ExplanationPanel from "../shared/ExplanationPanel"
 import StaticChart from "../charts/StaticChart"
 import InteractiveConfusionMatrix from "../charts/InteractiveConfusionMatrix"
+import TimeSeriesChart from "../charts/TimeSeriesChart"
 
 const VERDICT_CONFIG = {
   strong: { label: "Strong performance",    colour: "text-green-700", bg: "bg-green-50",  border: "border-green-200" },
@@ -14,6 +15,9 @@ const VERDICT_CONFIG = {
   fair:   { label: "Fair performance",      colour: "text-amber-700", bg: "bg-amber-50",  border: "border-amber-200" },
   poor:   { label: "Needs improvement",     colour: "text-red-700",   bg: "bg-red-50",    border: "border-red-200" }
 }
+
+// Keys to always hide from the metric grid
+const HIDDEN_METRIC_KEYS = new Set(["confusion_matrix", "predictions"])
 
 export default function EvaluationView() {
   const { sessionId } = useSession()
@@ -53,9 +57,23 @@ export default function EvaluationView() {
 
   const verdict = result?.verdict
   const vc      = VERDICT_CONFIG[verdict] ?? VERDICT_CONFIG.fair
+  const isTs    = result?.is_time_series ?? false
 
-  // Static charts from agent (e.g. ROC, PR curve, residuals)
-  const staticCharts = (result?.charts ?? []).filter(c => !c.includes("confusion"))
+  // Static charts — for TS models, skip the static time_series chart since the
+  // interactive chart below already shows actual vs predicted
+  const staticCharts = (result?.charts ?? []).filter(c => {
+    if (c.includes("confusion")) return false
+    if (isTs && c.includes("time_series")) return false
+    return true
+  })
+
+  // Metric grid: skip internal/non-numeric keys, raw arrays, and hidden keys
+  const metricEntries = Object.entries(result?.metrics ?? {}).filter(([key, val]) => {
+    if (HIDDEN_METRIC_KEYS.has(key)) return false
+    if (Array.isArray(val)) return false
+    if (typeof val !== "number") return false
+    return true
+  })
 
   return (
     <div className="space-y-6">
@@ -89,14 +107,16 @@ export default function EvaluationView() {
                 {vc.label}
               </p>
               <p className="text-gray-700 text-sm">
-                {result.metric_name}:{" "}
+                {result.primary_metric_name?.toUpperCase() ?? "Score"}:{" "}
                 <span className="font-mono font-bold text-gray-900 text-base">
-                  {result.test_score?.toFixed(4) ?? result.val_score?.toFixed(4) ?? "—"}
+                  {result.primary_metric_value != null
+                    ? result.primary_metric_value.toFixed(4)
+                    : "—"}
                 </span>
-                {" "}on the held-out test set
+                {" "}on the held-out {result.split_evaluated ?? "validation"} set
               </p>
-              {result.plain_english_verdict && (
-                <p className="text-sm text-gray-600 mt-2">{result.plain_english_verdict}</p>
+              {result.verdict_message && (
+                <p className="text-sm text-gray-600 mt-2">{result.verdict_message}</p>
               )}
             </div>
           )}
@@ -106,27 +126,41 @@ export default function EvaluationView() {
           )}
 
           {/* Metric details */}
-          {result.metrics && (
+          {metricEntries.length > 0 && (
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              {Object.entries(result.metrics).map(([key, val]) => (
+              {metricEntries.map(([key, val]) => (
                 <div key={key} className="bg-gray-50 rounded-xl p-3 text-center">
-                  <p className="text-base font-semibold text-gray-800 font-mono">
-                    {typeof val === "number" ? val.toFixed(4) : String(val)}
+                  <p className="text-base font-semibold text-gray-800 font-mono break-all">
+                    {val.toFixed(4)}
                   </p>
-                  <p className="text-xs text-gray-400 mt-0.5">{key.replace(/_/g, " ")}</p>
+                  <p className="text-xs text-gray-400 mt-0.5 break-words">
+                    {key.replace(/_/g, " ")}
+                  </p>
                 </div>
               ))}
             </div>
           )}
 
           {/* Confusion matrix */}
-          {result.confusion_matrix && result.class_names && (
+          {result.metrics?.confusion_matrix && result.class_names && (
             <div className="border border-gray-100 rounded-2xl p-5 bg-white shadow-sm">
               <h3 className="font-semibold text-gray-800 mb-4">Prediction breakdown</h3>
               <InteractiveConfusionMatrix
-                matrix={result.confusion_matrix}
+                matrix={result.metrics.confusion_matrix}
                 classNames={result.class_names}
               />
+            </div>
+          )}
+
+          {/* Time series actual vs predicted (interactive) */}
+          {result.time_series_data?.length > 0 && (
+            <div className="border border-gray-100 rounded-2xl p-5 bg-white shadow-sm">
+              <h3 className="font-semibold text-gray-800 mb-1">Actual vs Predicted over time</h3>
+              <p className="text-xs text-gray-400 mb-4">
+                Blue line = what actually happened. Amber dashed = what the model predicted.
+                Closer together = better accuracy.
+              </p>
+              <TimeSeriesChart data={result.time_series_data} />
             </div>
           )}
 

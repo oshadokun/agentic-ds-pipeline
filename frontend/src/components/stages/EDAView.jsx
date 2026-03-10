@@ -57,7 +57,7 @@ function buildPages(result) {
 }
 
 export default function EDAView() {
-  const { sessionId } = useSession()
+  const { sessionId, session } = useSession()
   const {
     runStage, loadStageResult,
     stageRunning, stageResult, stageError,
@@ -68,12 +68,16 @@ export default function EDAView() {
   const [hasLoaded, setHasLoaded]   = useState(false)
   const [pendingDecisions, setPendingDecisions] = useState({})
 
-  const stageStatus        = getStageStatus("eda")
-  const isComplete         = stageStatus === "complete"
-  const result             = stageResult
-  const decisionsRequired  = result?.decisions_required ?? []
-  const needsDecisions     = decisionsRequired.length > 0
-  const allDecided         = decisionsRequired.every(d => pendingDecisions[d.id] !== undefined)
+  const stageStatus       = getStageStatus("eda")
+  const isComplete        = stageStatus === "complete"
+  const result            = stageResult
+  const tsColumns         = session?.config?.time_series_columns ?? []
+  // Never show identifier decision cards for date/time columns
+  const decisionsRequired = (result?.decisions_required ?? []).filter(
+    d => !d.id.startsWith("id_col__") || !tsColumns.includes(d.id.replace("id_col__", ""))
+  )
+  const needsDecisions    = decisionsRequired.length > 0
+  const allDecided        = decisionsRequired.every(d => pendingDecisions[d.id] !== undefined)
 
   function handleDecision(id, value) {
     setPendingDecisions(prev => ({ ...prev, [id]: value }))

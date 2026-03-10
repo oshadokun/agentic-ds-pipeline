@@ -10,7 +10,7 @@ import DataPreviewTable from "../shared/DataPreviewTable"
 import ExplanationPanel from "../shared/ExplanationPanel"
 
 export default function IngestionView() {
-  const { session, sessionId, refreshSession } = useSession()
+  const { session, sessionId, refreshSession, pendingFile, setPendingFile } = useSession()
   const {
     runStage, loadStageResult,
     stageRunning, stageResult, stageError,
@@ -38,7 +38,14 @@ export default function IngestionView() {
   const goalConfirmed     = !!(targetColumn && taskType)
 
   useEffect(() => {
-    if (isComplete) loadStageResult("ingestion")
+    if (isComplete) {
+      loadStageResult("ingestion")
+    } else if (pendingFile) {
+      // File was uploaded during goal capture — auto-ingest it now
+      const file = pendingFile
+      setPendingFile(null)
+      handleFile(file)
+    }
   }, []) // eslint-disable-line
 
   async function handleFile(file) {
@@ -163,10 +170,11 @@ export default function IngestionView() {
             <CheckCircle className="w-5 h-5 text-green-500 flex-shrink-0" />
             <div>
               <p className="font-semibold text-green-800 text-sm">
-                {result.file_name ?? "File loaded successfully"}
+                File loaded successfully
               </p>
               <p className="text-green-600 text-xs">
-                {result.row_count?.toLocaleString()} rows &middot; {result.column_count} columns
+                {result.structural_check?.row_count?.toLocaleString()} rows
+                &middot; {result.structural_check?.column_count} columns
               </p>
             </div>
           </div>

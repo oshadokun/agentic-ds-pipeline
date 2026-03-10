@@ -9,6 +9,45 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# Date / time-series column detection
+# ---------------------------------------------------------------------------
+
+# Tokens that strongly indicate a date column by name
+_DATE_NAME_TOKENS = {"date", "time", "timestamp", "datetime", "day", "month", "year"}
+
+
+def _detect_time_series_columns(df: pd.DataFrame, target_col: str) -> list:
+    """
+    Return a list of column names that appear to contain date/time values.
+    Uses two independent signals:
+      1. Name-based: the column name contains a known date-related token.
+      2. Value-based: pandas can parse >70% of sampled values as dates.
+    A column matching either signal is treated as a date column.
+    """
+    date_cols = []
+    for col in df.columns:
+        if col == target_col:
+            continue
+        # --- Signal 1: name ---
+        col_norm = col.lower().replace(" ", "_").replace("-", "_")
+        if any(tok in col_norm for tok in _DATE_NAME_TOKENS):
+            date_cols.append(col)
+            continue
+        # --- Signal 2: pandas date parsing on object columns ---
+        if df[col].dtype == object:
+            sample = df[col].dropna().head(50)
+            if len(sample) == 0:
+                continue
+            try:
+                parsed = pd.to_datetime(sample, infer_datetime_format=True, errors="coerce")
+                if parsed.notna().mean() > 0.7:
+                    date_cols.append(col)
+            except Exception:
+                pass
+    return date_cols
+
+
+# ---------------------------------------------------------------------------
 # Individual check functions  (from validation SKILL)
 # ---------------------------------------------------------------------------
 
@@ -171,10 +210,12 @@ def _validate_duplicates(df: pd.DataFrame) -> list:
     return results
 
 
-def _validate_variance(df: pd.DataFrame) -> list:
+def _validate_variance(df: pd.DataFrame, date_cols: list) -> list:
     results = []
 
     for col in df.columns:
+        if col in date_cols:
+            continue  # Date columns are handled separately — skip all cardinality/ID checks
         n_unique = df[col].nunique()
         if n_unique == 1:
             results.append({
@@ -196,12 +237,14 @@ def _validate_variance(df: pd.DataFrame) -> list:
     return results
 
 
-def _validate_dtypes(df: pd.DataFrame, target_col: str) -> list:
+def _validate_dtypes(df: pd.DataFrame, target_col: str, date_cols: list) -> list:
     results = []
 
     for col in df.columns:
         if col == target_col:
             continue
+        if col in date_cols:
+            continue  # Skip date columns — they will be feature-engineered, not converted
         if df[col].dtype == object:
             sample      = df[col].dropna().head(100)
             if len(sample) == 0:
@@ -220,13 +263,30 @@ def _validate_dtypes(df: pd.DataFrame, target_col: str) -> list:
 
 
 def _run_validation(df: pd.DataFrame, target_col: str, task_type: str) -> dict:
+    # Detect date/time columns first — these are excluded from cardinality and dtype checks
+    date_cols    = _detect_time_series_columns(df, target_col)
+
     all_results  = []
     all_results += _validate_target(df, target_col, task_type)
     all_results += _validate_size(df)
     all_results += _validate_missing(df)
     all_results += _validate_duplicates(df)
-    all_results += _validate_variance(df)
-    all_results += _validate_dtypes(df, target_col)
+    all_results += _validate_variance(df, date_cols)
+    all_results += _validate_dtypes(df, target_col, date_cols)
+
+    # Add advisory entries for detected date columns
+    for col in date_cols:
+        all_results.append({
+            "check":    "date_column",
+            "severity": "advisory",
+            "column":   col,
+            "message":  (
+                f"We found a date column '{col}'. Rather than treating it as a raw value, "
+                f"we will extract useful time features from it — such as month, year, "
+                f"day of week, and quarter."
+            ),
+            "action":   "No action needed. Date features will be created automatically during the feature preparation stage."
+        })
 
     hard_stops = [r for r in all_results if r["severity"] == "hard_stop"]
     warnings   = [r for r in all_results if r["severity"] == "warning"]
@@ -235,11 +295,12 @@ def _run_validation(df: pd.DataFrame, target_col: str, task_type: str) -> dict:
     overall = "hard_stop" if hard_stops else "warnings" if warnings else "passed"
 
     return {
-        "overall_status":   overall,
-        "hard_stops":       hard_stops,
-        "warnings":         warnings,
-        "advisories":       advisories,
-        "total_checks_run": len(all_results)
+        "overall_status":     overall,
+        "hard_stops":         hard_stops,
+        "warnings":           warnings,
+        "advisories":         advisories,
+        "total_checks_run":   len(all_results),
+        "time_series_columns": date_cols,
     }
 
 
@@ -280,11 +341,12 @@ def run(session: dict, decisions: dict) -> dict:
     else:
         df_for_validation = df
 
-    report       = _run_validation(df_for_validation, target_col, task_type)
-    hard_stops   = report["hard_stops"]
-    warnings     = report["warnings"]
-    advisories   = report["advisories"]
-    overall      = report["overall_status"]
+    report             = _run_validation(df_for_validation, target_col, task_type)
+    hard_stops         = report["hard_stops"]
+    warnings           = report["warnings"]
+    advisories         = report["advisories"]
+    overall            = report["overall_status"]
+    time_series_cols   = report.get("time_series_columns", [])
 
     # Build decisions_required from warnings that need user input
     decisions_required = []
@@ -293,8 +355,8 @@ def run(session: dict, decisions: dict) -> dict:
             minority_pct = w.get("minority_pct", 0)
             minority_cls = w.get("minority_cls", "minority")
             majority_cls = w.get("majority_cls", "majority")
-            # Recommend class weights for mild, oversample for severe
-            rec = "class_weights" if minority_pct >= 0.05 else "oversample"
+            # Recommend class weights for mild imbalance, SMOTE for severe
+            rec = "class_weights" if minority_pct >= 0.05 else "smote"
             decisions_required.append({
                 "id":       "imbalance_strategy",
                 "question": w["message"],
@@ -313,9 +375,12 @@ def run(session: dict, decisions: dict) -> dict:
                         "tradeoff": f"Tells the model to penalise mistakes on '{minority_cls}' more heavily. No data is added or removed.",
                     },
                     {
-                        "id":       "oversample",
-                        "label":    f"Oversample — duplicate '{minority_cls}' rows",
-                        "tradeoff": f"Copies minority rows until classes are balanced. Effective but can overfit if the dataset is small.",
+                        "id":       "smote",
+                        "label":    f"SMOTE — create synthetic '{minority_cls}' examples",
+                        "tradeoff": (
+                            f"Generates new realistic-looking '{minority_cls}' rows by interpolating between existing ones. "
+                            f"More effective than simple duplication, but requires enough minority rows to work from."
+                        ),
                     },
                     {
                         "id":       "undersample",
@@ -383,6 +448,7 @@ def run(session: dict, decisions: dict) -> dict:
         "decisions_required":   decisions_required,
         "decisions_made":       [],
         "plain_english_summary": summary,
+        "time_series_columns":  time_series_cols,
         "report_section": {
             "stage":   "validation",
             "title":   "Checking Your Data Quality",
@@ -401,5 +467,7 @@ def run(session: dict, decisions: dict) -> dict:
             "validation_passed":        overall != "hard_stop",
             "class_imbalance_detected": class_imbalance,
             "imbalance_strategy":       decisions.get("imbalance_strategy", None),
+            "is_time_series":           len(time_series_cols) > 0,
+            "time_series_columns":      time_series_cols,
         }
     }

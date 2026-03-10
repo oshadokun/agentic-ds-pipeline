@@ -4,7 +4,7 @@
  * All session data flows down through this context.
  */
 
-import { createContext, useContext, useReducer, useCallback } from "react"
+import { createContext, useContext, useReducer, useCallback, useState } from "react"
 import { api } from "../api"
 
 // ---------------------------------------------------------------------------
@@ -92,6 +92,7 @@ const SessionContext = createContext(null)
 
 export function SessionProvider({ children }) {
   const [state, dispatch] = useReducer(sessionReducer, initialState)
+  const [pendingFile, setPendingFile] = useState(null)
 
   // ---- Load all sessions (home screen) -----------------------------------
   const loadSessions = useCallback(async () => {
@@ -162,6 +163,7 @@ export function SessionProvider({ children }) {
   // ---- Local helpers -------------------------------------------------------
   const clearSession = useCallback(() => {
     dispatch({ type: "CLEAR_SESSION" })
+    setPendingFile(null)
   }, [])
 
   const clearError = useCallback(() => {
@@ -182,7 +184,9 @@ export function SessionProvider({ children }) {
     deleteSession,
     clearSession,
     clearError,
-    updateStageStatus
+    updateStageStatus,
+    pendingFile,
+    setPendingFile
   }
 
   return (

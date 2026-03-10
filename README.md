@@ -177,6 +177,7 @@ ds-pipeline/
 │       │   │   ├── PerformanceTrendChart.jsx
 │       │   │   ├── DriftSummaryDonut.jsx
 │       │   │   ├── StaticChart.jsx
+│       │   │   ├── TimeSeriesChart.jsx        ← Upgrade 1: actual vs predicted over time
 │       │   │   └── chartTheme.js
 │       │   └── stages/
 │       │       ├── GoalCaptureView.jsx
@@ -192,10 +193,12 @@ ds-pipeline/
 │       │       ├── TuningView.jsx
 │       │       ├── ExplainabilityView.jsx
 │       │       ├── DeploymentView.jsx
-│       │       └── MonitoringView.jsx
+│       │       ├── MonitoringView.jsx
+│       │       └── InsightsDashboard.jsx      ← Upgrade 2: cross-stage insights tab
 │       ├── contexts/
 │       │   ├── SessionContext.jsx
 │       │   └── PipelineContext.jsx
+│       ├── stageConfig.js                     ← STAGE_ORDER and STAGE_LABELS constants
 │       └── styles/
 │           └── globals.css
 │
@@ -542,6 +545,119 @@ continuing:
 3. Read the skill file for the next file to be built
 4. Continue from where the build stopped — do not rebuild completed files
    unless the user explicitly asks you to
+
+---
+
+### Phase 6 — Advanced Features (Upgrades applied post-build)
+
+These upgrades extend the app after the initial build is complete.
+Read the relevant skill files listed above before making any changes.
+
+**Upgrade 1 — Time Series Forecasting**
+
+| File | Change |
+|---|---|
+| `agents/feature_engineering.py` | Detect date columns; extract month/year/day-of-week/quarter/week; offer lag feature decision |
+| `agents/training.py` | Add Prophet and ARIMA options; auto-recommend when date column detected |
+| `agents/evaluation.py` | Add actual vs predicted time series chart output |
+| `charts/TimeSeriesChart.jsx` | CREATE — interactive Recharts line chart, actual vs predicted |
+| `stages/EvaluationView.jsx` | Show TimeSeriesChart when model is time series type |
+| `stages/TrainingView.jsx` | Show Prophet / ARIMA options in model selection |
+| `stages/FeatureEngineeringView.jsx` | Add LagFeatureCard for lag configuration decisions |
+
+**Upgrade 2 — Insights Dashboard Tab**
+
+| File | Change |
+|---|---|
+| `stages/InsightsDashboard.jsx` | CREATE — permanent tab aggregating cross-stage insights |
+| `shell/AppShell.jsx` | Add Insights as always-visible tab |
+| `shell/ProgressSidebar.jsx` | Reflect Insights tab in navigation |
+| `contexts/SessionContext.jsx` | Expose stage result data needed by the dashboard |
+| `backend/main.py` | Add `GET /sessions/{id}/insights` endpoint |
+
+---
+
+## App Map
+
+This table shows how each part of the app connects end-to-end.
+
+```
+User action in browser
+  → Frontend tab / stage view (frontend/src/components/stages/)
+    → api.js call
+      → FastAPI endpoint in backend/main.py
+        → Agent module in backend/agents/{stage}.py
+          → Skill file reference in skills/pipeline/{stage}/SKILL.md
+            → Session state written to sessions/{id}/outputs/{stage}/result.json
+              → session.json updated
+                → Result returned to frontend for display
+```
+
+| Frontend Tab | Component | Endpoint | Agent | Skill File |
+|---|---|---|---|---|
+| Goal | GoalCaptureView | POST /sessions | — | ui-interaction/SKILL.md |
+| Upload Data | IngestionView | POST /sessions/{id}/data | ingestion.py | ingestion/SKILL.md |
+| Check Data | ValidationView | POST /stages/validation/run | validation.py | validation/SKILL.md |
+| Explore Data | EDAView | POST /stages/eda/run | eda.py | eda/SKILL.md |
+| Clean Data | CleaningView | POST /stages/cleaning/run | cleaning.py | cleaning/SKILL.md |
+| Prepare Features | FeatureEngineeringView | POST /stages/feature_engineering/run | feature_engineering.py | feature-engineering/SKILL.md |
+| Scale Data | NormalisationView | POST /stages/normalisation/run | normalisation.py | normalisation/SKILL.md |
+| Split Data | SplittingView | POST /stages/splitting/run | splitting.py | splitting/SKILL.md |
+| Train Model | TrainingView | POST /stages/training/run | training.py | training/SKILL.md |
+| Evaluate | EvaluationView | POST /stages/evaluation/run | evaluation.py | evaluation/SKILL.md |
+| Tune Model | TuningView | POST /stages/tuning/run | tuning.py | tuning/SKILL.md |
+| Explain | ExplainabilityView | POST /stages/explainability/run | explainability.py | explainability/SKILL.md |
+| Deploy | DeploymentView | POST /stages/deployment/run | deployment.py | deployment/SKILL.md |
+| Monitor | MonitoringView | POST /stages/monitoring/run | monitoring.py | monitoring/SKILL.md |
+| Insights | InsightsDashboard | GET /sessions/{id}/insights | reads existing outputs | session-state/SKILL.md |
+
+**Session state** for each stage lives at:
+`sessions/{id}/outputs/{stage}/result.json`
+
+**Shared chart images** (matplotlib/seaborn, served by backend):
+`sessions/{id}/reports/{stage}/*.png`
+
+---
+
+## Advanced Capabilities
+
+### Time Series Forecasting
+
+When the uploaded dataset contains a date or datetime column, the pipeline
+automatically switches to time series mode:
+
+- **Feature Engineering**: extracts month, year, day of week, quarter, week
+  number, and optionally creates lag features (user selects columns and
+  look-back periods: 1, 3, 7, 14, 30)
+- **Training**: offers Prophet (trend + seasonality decomposition) and ARIMA
+  (statistical autoregression) as model options alongside the standard
+  regression models; the recommended default is auto-selected based on data
+  size and date column presence
+- **Evaluation**: shows an actual vs predicted chart over time
+  (`TimeSeriesChart.jsx`) in addition to standard regression metrics
+- **Splitting**: uses temporal split (chronological order) instead of random
+  split when a date column is present
+
+Activate automatically when a date column is detected — no user configuration
+required.
+
+---
+
+### Insights Dashboard
+
+A permanent tab visible throughout the pipeline that aggregates results from
+every completed stage into a single plain-English view:
+
+- **Before any data**: friendly prompt to get started
+- **After ingestion**: data shape, column types, sample rows
+- **After EDA**: distribution charts, correlation highlights
+- **After training/evaluation**: model performance, metric cards
+- **After explainability**: feature importance chart
+- **If date column present**: time series trends
+
+All charts are interactive (Recharts). All data is read from existing
+`result.json` files — no new analysis is performed. Consistent with the
+design system: #1B3A5C primary, #D97706 accent, DM Serif Display headings.
 
 ---
 

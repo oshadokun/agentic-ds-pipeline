@@ -48,8 +48,15 @@ export default function TuningView() {
     setApplying(false)
   }
 
-  const improvement = result?.best_score && result?.baseline_score
-    ? ((result.best_score - result.baseline_score) * 100).toFixed(2)
+  const isSkipped  = result?.verdict === "skipped"
+  const isArimaMae = result?.model_id === "arima"
+
+  // For ARIMA, lower score (MAE) is better — improvement = baseline - tuned (positive = better).
+  // For all other models, higher score is better — improvement = tuned - baseline.
+  const improvement = result?.tuned_score != null && result?.baseline_score != null
+    ? isArimaMae
+      ? ((result.baseline_score - result.tuned_score) / Math.max(Math.abs(result.baseline_score), 1e-9) * 100).toFixed(2)
+      : ((result.tuned_score - result.baseline_score) * 100).toFixed(2)
     : null
 
   if (stageRunning || applying) {
@@ -123,33 +130,39 @@ export default function TuningView() {
             <ExplanationPanel message={result.plain_english_summary} />
           )}
 
-          {/* Before / after */}
-          <div className="grid grid-cols-3 gap-3">
-            <div className="bg-gray-50 rounded-xl p-3 text-center">
-              <p className="text-xs text-gray-400 mb-1">Before tuning</p>
-              <p className="text-lg font-semibold text-gray-600 font-mono">
-                {result.baseline_score?.toFixed(4) ?? "—"}
-              </p>
-            </div>
-            <div className="bg-blue-50 rounded-xl p-3 text-center border border-blue-100">
-              <p className="text-xs text-blue-500 mb-1">After tuning</p>
-              <p className="text-lg font-semibold text-[#1B3A5C] font-mono">
-                {result.best_score?.toFixed(4) ?? "—"}
-              </p>
-            </div>
-            <div className={`rounded-xl p-3 text-center ${
-              parseFloat(improvement) > 0 ? "bg-green-50" : "bg-gray-50"
-            }`}>
-              <p className="text-xs text-gray-400 mb-1">Improvement</p>
-              <p className={`text-lg font-semibold font-mono ${
-                parseFloat(improvement) > 0 ? "text-green-700" : "text-gray-500"
+          {/* Before / after — hidden when tuning was skipped (Prophet) */}
+          {!isSkipped && (
+            <div className="grid grid-cols-3 gap-3">
+              <div className="bg-gray-50 rounded-xl p-3 text-center">
+                <p className="text-xs text-gray-400 mb-1">
+                  Before tuning {isArimaMae ? "(MAE)" : ""}
+                </p>
+                <p className="text-lg font-semibold text-gray-600 font-mono">
+                  {result.baseline_score?.toFixed(4) ?? "—"}
+                </p>
+              </div>
+              <div className="bg-blue-50 rounded-xl p-3 text-center border border-blue-100">
+                <p className="text-xs text-blue-500 mb-1">
+                  After tuning {isArimaMae ? "(MAE)" : ""}
+                </p>
+                <p className="text-lg font-semibold text-[#1B3A5C] font-mono">
+                  {result.tuned_score?.toFixed(4) ?? "—"}
+                </p>
+              </div>
+              <div className={`rounded-xl p-3 text-center ${
+                parseFloat(improvement) > 0 ? "bg-green-50" : "bg-gray-50"
               }`}>
-                {improvement !== null
-                  ? `${parseFloat(improvement) >= 0 ? "+" : ""}${improvement}%`
-                  : "—"}
-              </p>
+                <p className="text-xs text-gray-400 mb-1">Improvement</p>
+                <p className={`text-lg font-semibold font-mono ${
+                  parseFloat(improvement) > 0 ? "text-green-700" : "text-gray-500"
+                }`}>
+                  {improvement !== null
+                    ? `${parseFloat(improvement) >= 0 ? "+" : ""}${improvement}%`
+                    : "—"}
+                </p>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Trial chart */}
           {result.trials?.length > 0 && (

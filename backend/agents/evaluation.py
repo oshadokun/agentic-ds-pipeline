@@ -56,15 +56,25 @@ def _evaluate_classifier(model, X, y, task_type: str) -> dict:
 def _evaluate_regressor(model, X, y) -> dict:
     y_pred = model.predict(X)
     return {
-        "rmse":        round(float(np.sqrt(mean_squared_error(y, y_pred))), 4),
-        "mae":         round(float(mean_absolute_error(y, y_pred)), 4),
-        "r2":          round(float(r2_score(y, y_pred)), 4),
-        "predictions": y_pred.tolist()
+        "rmse": round(float(np.sqrt(mean_squared_error(y, y_pred))), 4),
+        "mae":  round(float(mean_absolute_error(y, y_pred)), 4),
+        "r2":   round(float(r2_score(y, y_pred)), 4),
+    }
+
+
+def _evaluate_time_series_model(model, X, y) -> dict:
+    """For ARIMA / Prophet: MAE and RMSE only — no R², no raw predictions array."""
+    y_vals = y.values if hasattr(y, "values") else np.array(y)
+    y_pred = model.predict(X)
+    return {
+        "mae":  round(float(mean_absolute_error(y_vals, y_pred)), 4),
+        "rmse": round(float(np.sqrt(mean_squared_error(y_vals, y_pred))), 4),
     }
 
 
 def _interpret_metrics(metrics: dict, task_type: str, target_col: str,
-                        class_names: list = None) -> list:
+                        class_names: list = None, y_range: float = None,
+                        is_ts: bool = False) -> list:
     interps = []
 
     if task_type == "binary_classification":
@@ -97,12 +107,36 @@ def _interpret_metrics(metrics: dict, task_type: str, target_col: str,
         interps.append(f"The model correctly predicted the outcome for {acc:.1%} of rows.")
         interps.append(f"The weighted F1 score is {f1:.2f} (1.0 = perfect).")
 
-    elif task_type == "regression" or "time_series" in task_type or "forecast" in task_type:
+    elif is_ts:
+        # Time series: MAE only — no R² language
+        mae     = metrics.get("mae", 0)
+        rmse    = metrics.get("rmse", 0)
+        mae_pct = (mae / y_range * 100) if y_range else None
+        interps.append(
+            f"On average, its forecasts are off by {mae:.4g} "
+            f"(in the same units as '{target_col}'). "
+            f"RMSE: {rmse:.4g}. "
+            f"We'll try to improve this in the tuning step."
+        )
+        if mae_pct is not None:
+            if mae_pct < 5:
+                interps.append(
+                    f"This is a strong result — the average error is only {mae_pct:.1f}% of the value range."
+                )
+            elif mae_pct < 15:
+                interps.append(
+                    f"This is reasonable — the average error is {mae_pct:.1f}% of the value range."
+                )
+            else:
+                interps.append(
+                    f"There is room for improvement — the average error is {mae_pct:.1f}% of the value range."
+                )
+
+    elif task_type == "regression":
         mae = metrics.get("mae", 0)
         r2  = metrics.get("r2", 0)
-        label = "forecast" if ("time_series" in task_type or "forecast" in task_type) else "prediction"
         interps.append(
-            f"On average, the model's {label}s are off by about {mae:.4f} "
+            f"On average, the model's predictions are off by about {mae:.4f} "
             f"(in the same units as '{target_col}')."
         )
         quality = ("strong performance" if r2 > 0.8
@@ -138,7 +172,7 @@ def _performance_verdict(metrics: dict, task_type: str,
         else:
             return "fair",   "Performance is moderate. Tuning is recommended."
 
-    elif task_type == "regression" or "time_series" in task_type or "forecast" in task_type:
+    elif task_type == "regression":
         r2 = metrics.get("r2", 0)
         if r2 >= 0.85:
             return "strong", "The model explains most of the variation in your target. Strong performance."
@@ -150,6 +184,20 @@ def _performance_verdict(metrics: dict, task_type: str,
             return "poor",   "The model is not explaining the variation well. Review features and data quality."
 
     return "unknown", "Unable to determine verdict."
+
+
+def _performance_verdict_ts(metrics: dict, y_range: float) -> tuple[str, str]:
+    """Verdict for time series models based on MAE as a % of the target value range."""
+    mae     = metrics.get("mae", 0)
+    mae_pct = (mae / y_range * 100) if y_range else 50
+    if mae_pct < 5:
+        return "strong", "The model is forecasting with strong accuracy. We recommend proceeding to tuning to see if we can improve it further."
+    elif mae_pct < 15:
+        return "good",   "The model is capturing the main patterns. Tuning may improve accuracy further."
+    elif mae_pct < 30:
+        return "fair",   "The model is learning but the error is noticeable. Tuning is recommended before deployment."
+    else:
+        return "poor",   "Forecast errors are large relative to the value range. Review feature engineering and data quality before proceeding."
 
 
 def _interpret_confusion_matrix(cm: list, class_names: list) -> str:
@@ -207,6 +255,24 @@ def _plot_roc(model, X, y, output_dir: str) -> str:
     return str(path)
 
 
+def _plot_time_series_predictions(y_true, y_pred, output_dir: str) -> str:
+    """Line chart: actual vs predicted over time (index)."""
+    n = len(y_true)
+    idx = list(range(n))
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(idx, y_true,  color="#1B3A5C", linewidth=1.5, label="Actual",    alpha=0.9)
+    ax.plot(idx, y_pred,  color="#D97706", linewidth=1.5, label="Predicted", alpha=0.8, linestyle="--")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Value")
+    ax.set_title("Actual vs Predicted over time")
+    ax.legend()
+    plt.tight_layout()
+    path = Path(output_dir) / "time_series_predictions.png"
+    plt.savefig(path, bbox_inches="tight", dpi=100)
+    plt.close()
+    return str(path)
+
+
 def _plot_residuals(y_true, y_pred, output_dir: str) -> str:
     residuals = np.array(y_true) - np.array(y_pred)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -238,7 +304,8 @@ def run(session: dict, decisions: dict) -> dict:
     session_id        = session["session_id"]
     target_col        = session["goal"].get("target_column")
     task_type         = session["goal"].get("task_type", "binary_classification")
-    class_imbalance   = session["config"].get("class_imbalance_detected", False)
+    class_imbalance   = session.get("config", {}).get("class_imbalance_detected", False)
+    is_ts             = session.get("config", {}).get("is_time_series", False)
     is_final          = decisions.get("is_final_evaluation", False)
     sessions_dir      = Path("sessions")
     session_dir       = sessions_dir / session_id
@@ -288,6 +355,15 @@ def run(session: dict, decisions: dict) -> dict:
         class_names = sorted([str(c) for c in y_eval.unique()])
 
     # Compute metrics
+    time_series_data = None
+    is_time_series_model = (
+        is_ts or
+        model.__class__.__name__ in ("ARIMAWrapper", "ProphetWrapper") or
+        "time_series" in task_type or
+        "forecast" in task_type
+    )
+    y_range = None
+
     if "classification" in task_type:
         metrics = _evaluate_classifier(model, X_eval, y_eval, task_type)
         charts  = [
@@ -295,13 +371,38 @@ def run(session: dict, decisions: dict) -> dict:
         ]
         if task_type == "binary_classification":
             charts.append(_plot_roc(model, X_eval, y_eval, str(output_dir)))
+
+    elif is_time_series_model:
+        metrics = _evaluate_time_series_model(model, X_eval, y_eval)
+        y_pred  = model.predict(X_eval)
+        y_true_list = y_eval.tolist()
+        y_pred_list = [float(v) for v in y_pred]
+        y_range = float(y_eval.max() - y_eval.min()) if len(y_eval) > 0 else None
+        charts  = [_plot_time_series_predictions(y_true_list, y_pred_list, str(output_dir))]
+        # Data for interactive frontend chart (sample to ≤200 points for performance)
+        step = max(1, len(y_true_list) // 200)
+        time_series_data = [
+            {"index": i, "actual": round(y_true_list[i], 4), "predicted": round(y_pred_list[i], 4)}
+            for i in range(0, len(y_true_list), step)
+        ]
+
     else:
         metrics = _evaluate_regressor(model, X_eval, y_eval)
         y_pred  = model.predict(X_eval)
-        charts  = [_plot_residuals(y_eval.tolist(), y_pred.tolist(), str(output_dir))]
+        y_true_list = y_eval.tolist()
+        y_pred_list = [float(v) for v in y_pred]
+        charts  = [_plot_residuals(y_true_list, y_pred_list, str(output_dir))]
 
-    interpretations = _interpret_metrics(metrics, task_type, target_col, class_names)
-    verdict, verdict_msg = _performance_verdict(metrics, task_type, class_imbalance)
+    interpretations = _interpret_metrics(
+        metrics, task_type, target_col, class_names,
+        y_range=y_range, is_ts=is_time_series_model
+    )
+
+    if is_time_series_model:
+        verdict, verdict_msg = _performance_verdict_ts(metrics, y_range)
+    else:
+        verdict, verdict_msg = _performance_verdict(metrics, task_type, class_imbalance)
+
     cm_text = _interpret_confusion_matrix(
         metrics.get("confusion_matrix", []), class_names
     ) if is_final and "classification" in task_type else None
@@ -309,10 +410,13 @@ def run(session: dict, decisions: dict) -> dict:
     summary = " ".join(interpretations[:2]) + f" Our assessment: {verdict_msg}"
 
     # Primary metric value for config
-    if task_type == "binary_classification":
+    if is_time_series_model:
+        primary_metric       = "mae"
+        primary_metric_value = metrics.get("mae", 0)
+    elif task_type == "binary_classification":
         primary_metric       = "pr_auc" if class_imbalance else "roc_auc"
         primary_metric_value = metrics.get(primary_metric, metrics.get("accuracy", 0))
-    elif task_type == "regression" or "time_series" in task_type or "forecast" in task_type:
+    elif task_type == "regression":
         primary_metric       = "r2"
         primary_metric_value = metrics.get("r2", 0)
     else:
@@ -324,12 +428,16 @@ def run(session: dict, decisions: dict) -> dict:
         "status":                    "success",
         "split_evaluated":           split_name,
         "metrics":                   metrics,
+        "is_time_series":            is_time_series_model,
         "interpretations":           interpretations,
         "verdict":                   verdict,
         "verdict_message":           verdict_msg,
+        "primary_metric_name":       primary_metric,
+        "primary_metric_value":      primary_metric_value,
         "confusion_matrix_text":     cm_text,
         "charts":                    charts,
         "class_names":               class_names,
+        "time_series_data":          time_series_data,
         "decisions_required":        [],
         "decisions_made":            [],
         "plain_english_summary":     summary,

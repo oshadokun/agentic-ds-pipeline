@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { CheckCircle, AlertTriangle, XCircle, Info } from "lucide-react"
+import { CheckCircle, AlertTriangle, XCircle, Info, Calendar } from "lucide-react"
 import { usePipeline } from "../../contexts/PipelineContext"
 import AgentRunning from "../shared/AgentRunning"
 import AlertBanner from "../shared/AlertBanner"
@@ -41,12 +41,18 @@ export default function ValidationView() {
     load()
   }, []) // eslint-disable-line
 
-  const checks     = result?.checks ?? []
-  const hasStop    = result?.hard_stop === true || result?.status === "hard_stop"
-  const hardStops  = checks.filter(c => !c.passed && c.severity === "hard_stop")
-  const warnings   = checks.filter(c => !c.passed && c.severity === "warning")
-  const advisories = checks.filter(c => !c.passed && c.severity === "advisory")
-  const passed     = checks.filter(c => c.passed)
+  const hasStop         = result?.hard_stop === true || result?.status === "hard_stop"
+  const report          = result?.validation_report ?? {}
+  const hardStops       = report.hard_stops  ?? []
+  const warnings        = report.warnings    ?? []
+  // Suppress date_column advisories — they are already surfaced as purple Date cards
+  const advisories      = (report.advisories ?? []).filter(
+    a => a.check !== "date_column"
+  )
+  const totalChecks     = report.total_checks_run ?? 0
+  const failedCount     = hardStops.length + warnings.length + advisories.length
+  const passedCount     = Math.max(0, totalChecks - failedCount)
+  const timeSeriesCols  = result?.time_series_columns ?? []
 
   if (stageRunning) {
     return (
@@ -91,7 +97,7 @@ export default function ValidationView() {
             <ExplanationPanel message={result.plain_english_summary} />
           )}
 
-          {hasStop && (
+          {hasStop && hardStops.length > 0 && (
             <AlertBanner
               type="error"
               title={`${hardStops.length} critical issue${hardStops.length > 1 ? "s" : ""} found`}
@@ -100,8 +106,8 @@ export default function ValidationView() {
           )}
 
           <div className="space-y-2">
-            {[...hardStops, ...warnings, ...advisories, ...passed].map((check, i) => {
-              const sev = !check.passed ? check.severity : "pass"
+            {[...hardStops, ...warnings, ...advisories].map((check, i) => {
+              const sev = check.severity
               return (
                 <div
                   key={i}
@@ -109,26 +115,52 @@ export default function ValidationView() {
                 >
                   {SEVERITY_ICON[sev]}
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-gray-800">{check.plain_english}</p>
-                    {check.recommendation && !check.passed && (
-                      <p className="text-xs text-gray-500 mt-0.5">{check.recommendation}</p>
+                    <p className="text-sm font-medium text-gray-800">{check.message}</p>
+                    {check.action && (
+                      <p className="text-xs text-gray-500 mt-0.5">{check.action}</p>
                     )}
                   </div>
                   <span className={`text-xs font-medium px-2 py-0.5 rounded-full flex-shrink-0 ${
                     sev === "hard_stop" ? "bg-red-100 text-red-700"
                     : sev === "warning"  ? "bg-amber-100 text-amber-700"
-                    : sev === "advisory" ? "bg-blue-100 text-blue-700"
-                    : "bg-green-100 text-green-700"
+                    : "bg-blue-100 text-blue-700"
                   }`}>
-                    {sev === "pass" ? "Passed" : sev === "hard_stop" ? "Critical" : sev.charAt(0).toUpperCase() + sev.slice(1)}
+                    {sev === "hard_stop" ? "Critical" : sev.charAt(0).toUpperCase() + sev.slice(1)}
                   </span>
                 </div>
               )
             })}
           </div>
 
+          {/* Date / time columns found */}
+          {timeSeriesCols.length > 0 && (
+            <div className="space-y-2">
+              {timeSeriesCols.map(col => (
+                <div
+                  key={col}
+                  className="flex items-start gap-3 p-4 rounded-xl border border-purple-100 bg-purple-50"
+                >
+                  <Calendar className="w-5 h-5 text-purple-500 flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-800">
+                      Date column detected: <strong>{col}</strong>
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      We'll extract useful time features from this column automatically — month, year, day of week, and quarter.
+                    </p>
+                  </div>
+                  <span className="text-xs font-medium px-2 py-0.5 rounded-full flex-shrink-0 bg-purple-100 text-purple-700">
+                    Date
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
           <div className="flex gap-4 text-xs pl-1">
-            <span className="text-green-600">{passed.length} passed</span>
+            {passedCount > 0 && (
+              <span className="text-green-600">{passedCount} check{passedCount !== 1 ? "s" : ""} passed</span>
+            )}
             {warnings.length > 0 && (
               <span className="text-amber-600">{warnings.length} warning{warnings.length > 1 ? "s" : ""}</span>
             )}

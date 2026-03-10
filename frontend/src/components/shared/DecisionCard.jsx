@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { CheckCircle } from "lucide-react"
 
 /**
@@ -16,6 +16,13 @@ export default function DecisionCard({ decision, onConfirm, disabled = false }) 
   const [selected, setSelected] = useState(recommendation ?? alternatives[0]?.id ?? null)
   const [confirmed, setConfirmed] = useState(false)
 
+  // Keep selected in sync if recommendation arrives after initial mount
+  useEffect(() => {
+    if (recommendation !== undefined && recommendation !== null) {
+      setSelected(recommendation)
+    }
+  }, [recommendation])
+
   function handleConfirm() {
     if (selected === null || selected === undefined) return
     setConfirmed(true)
@@ -24,8 +31,8 @@ export default function DecisionCard({ decision, onConfirm, disabled = false }) 
 
   // Confirmed state — shows a compact summary row
   if (confirmed) {
-    const chosenLabel = alternatives.find(a => a.id === selected)?.label
-      ?? String(selected)
+    const chosen = alternatives.find(a => a.id === selected)
+    const chosenLabel = chosen?.label ?? chosen?.name ?? String(selected)
     return (
       <div className="flex items-center gap-3 p-3 bg-green-50 border border-green-200
                       rounded-xl mb-4 animate-fade-in">
@@ -83,7 +90,7 @@ export default function DecisionCard({ decision, onConfirm, disabled = false }) 
 
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap mb-0.5">
-                    <span className="font-medium text-gray-900 text-sm">{opt.label}</span>
+                    <span className="font-medium text-gray-900 text-sm">{opt.label ?? opt.name}</span>
                     {opt.id === recommendation && (
                       <span className="text-xs px-2 py-0.5 bg-amber-100
                                        text-amber-700 rounded-full font-medium">

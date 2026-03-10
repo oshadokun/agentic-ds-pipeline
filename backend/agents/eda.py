@@ -104,13 +104,17 @@ def _analyse_target(df: pd.DataFrame, target_col: str, task_type: str, output_di
     return result
 
 
-def _analyse_features(df: pd.DataFrame, target_col: str, output_dir: str) -> list:
-    results     = []
-    output_dir  = Path(output_dir)
+def _analyse_features(df: pd.DataFrame, target_col: str, output_dir: str,
+                       time_series_columns: list = None) -> list:
+    results              = []
+    output_dir           = Path(output_dir)
+    time_series_columns  = time_series_columns or []
 
     for col in df.columns:
         if col == target_col:
             continue
+        if col in time_series_columns:
+            continue  # Date columns are fully handled by validation — skip entirely
         col_result = {
             "column":       col,
             "dtype":        str(df[col].dtype),
@@ -272,10 +276,12 @@ def _analyse_feature_vs_target(df: pd.DataFrame, target_col: str,
 # ---------------------------------------------------------------------------
 
 def run(session: dict, decisions: dict) -> dict:
-    session_id = session["session_id"]
-    target_col = session["goal"].get("target_column")
-    task_type  = session["goal"].get("task_type", "binary_classification")
-    sessions_dir = Path("sessions")
+    session_id          = session["session_id"]
+    target_col          = session["goal"].get("target_column")
+    task_type           = session["goal"].get("task_type", "binary_classification")
+    sessions_dir        = Path("sessions")
+    # Columns already identified as date/time by the validation stage — never treat as identifiers
+    time_series_columns = session.get("config", {}).get("time_series_columns", [])
 
     if not target_col:
         return {
@@ -308,7 +314,7 @@ def run(session: dict, decisions: dict) -> dict:
     try:
         ov            = _overview(df, target_col)
         target_result = _analyse_target(df, target_col, task_type, output_dir)
-        features      = _analyse_features(df, target_col, output_dir)
+        features      = _analyse_features(df, target_col, output_dir, time_series_columns)
         correlations  = _analyse_correlations(df, target_col, output_dir)
         vs_target     = _analyse_feature_vs_target(df, target_col, task_type, output_dir)
     except Exception as exc:
@@ -340,6 +346,7 @@ def run(session: dict, decisions: dict) -> dict:
     high_card_cols = [
         f["column"] for f in features
         if f.get("advisory", "").startswith(f"'{f['column']}' has almost")
+        and f["column"] not in time_series_columns  # date cols are never identifiers
     ]
 
     # Build decisions list if first run (no decisions provided yet)

@@ -158,14 +158,164 @@ def _explain_params(params: dict) -> str:
 # run()
 # ---------------------------------------------------------------------------
 
+def _tune_arima(session_id, session_dir, splits_dir) -> dict:
+    """Grid search over ARIMA (p, d, q) orders. Returns a full stage result dict."""
+    from sklearn.metrics import mean_absolute_error as _mae
+    # Import ARIMAWrapper from training agent
+    import importlib
+    _training = importlib.import_module("training")
+    ARIMAWrapper = _training.ARIMAWrapper
+
+    try:
+        X_train = pd.read_csv(splits_dir / "X_train.csv")
+        X_val   = pd.read_csv(splits_dir / "X_val.csv")
+        y_train = pd.read_csv(splits_dir / "y_train.csv").squeeze()
+        y_val   = pd.read_csv(splits_dir / "y_val.csv").squeeze()
+    except FileNotFoundError:
+        return {
+            "stage":                 "tuning",
+            "status":                "failed",
+            "plain_english_summary": "No split data found. Please run the splitting stage first."
+        }
+
+    # Baseline MAE from the existing trained model
+    models_dir = session_dir / "models"
+    baseline_mae = None
+    best_json = models_dir / "best_model.json"
+    if best_json.exists():
+        with open(best_json) as f:
+            info = json.load(f)
+        with open(info["model_path"], "rb") as f:
+            trained_model = pickle.load(f)
+        try:
+            y_pred_base  = trained_model.predict(X_val)
+            baseline_mae = float(_mae(y_val, y_pred_base))
+        except Exception:
+            baseline_mae = None
+
+    # Grid search
+    best_order  = (1, 1, 1)
+    best_mae    = float("inf")
+    tried       = 0
+    for p in [0, 1, 2, 3]:
+        for d in [0, 1, 2]:
+            for q in [0, 1, 2, 3]:
+                try:
+                    m = ARIMAWrapper(order=(p, d, q))
+                    m.fit(X_train, y_train)
+                    y_pred = m.predict(X_val)
+                    mae    = float(_mae(y_val, y_pred))
+                    tried += 1
+                    if mae < best_mae:
+                        best_mae   = mae
+                        best_order = (p, d, q)
+                except Exception:
+                    continue
+
+    best_params = {"p": best_order[0], "d": best_order[1], "q": best_order[2]}
+
+    # Retrain on train + val combined with best order
+    X_combined = pd.concat([X_train, X_val], axis=0).reset_index(drop=True)
+    y_combined = pd.concat([y_train, y_val], axis=0).reset_index(drop=True)
+    final_model = ARIMAWrapper(order=best_order)
+    final_model.fit(X_combined, y_combined)
+
+    tuned_path  = models_dir / "tuned_model.pkl"
+    with open(tuned_path, "wb") as f:
+        pickle.dump(final_model, f)
+
+    params_path = models_dir / "best_params.json"
+    with open(params_path, "w") as f:
+        json.dump(best_params, f, indent=2)
+
+    # Update best_model.json if MAE improved (lower is better)
+    improved = baseline_mae is not None and best_mae < baseline_mae
+    if improved:
+        best_info = {}
+        if best_json.exists():
+            with open(best_json) as f:
+                best_info = json.load(f)
+        best_info["model_path"] = str(tuned_path)
+        best_info["tuned"]      = True
+        with open(best_json, "w") as f:
+            json.dump(best_info, f, indent=2)
+
+    if baseline_mae is not None:
+        imp     = baseline_mae - best_mae          # positive = improvement (lower MAE)
+        pct     = (imp / max(abs(baseline_mae), 1e-9)) * 100
+        if imp > 0.01 * baseline_mae:
+            verdict = "meaningful improvement"
+            rec     = f"The tuned ARIMA{best_order} is noticeably more accurate — we will use it going forward."
+        elif imp > 0:
+            verdict = "small improvement"
+            rec     = f"ARIMA{best_order} is slightly more accurate. We recommend using it."
+        else:
+            verdict = "no meaningful difference"
+            rec     = f"The original model was already well-specified. Using ARIMA{best_order} as the final model."
+        comparison_text = (
+            f"Before tuning: MAE {baseline_mae:.4g}\n"
+            f"After tuning:  MAE {best_mae:.4g}\n"
+            f"Change: {'+' if -imp >= 0 else ''}{-imp:.4g} ({'+' if -pct >= 0 else ''}{-pct:.1f}%)\n\n"
+            f"{rec}"
+        )
+        baseline_score = round(baseline_mae, 4)
+        tuned_score    = round(best_mae, 4)
+        improvement    = round(imp, 4)
+    else:
+        verdict         = "no meaningful difference"
+        comparison_text = rec = f"Best ARIMA order found: {best_order}."
+        baseline_score  = None
+        tuned_score     = round(best_mae, 4)
+        improvement     = 0
+
+    summary = (
+        f"We searched {tried} ARIMA(p,d,q) combinations. "
+        f"Best order: ARIMA{best_order} with MAE {best_mae:.4g}. "
+        f"{rec}"
+    )
+
+    return {
+        "stage":              "tuning",
+        "status":             "success",
+        "model_id":           "arima",
+        "n_trials_run":       tried,
+        "best_params":        best_params,
+        "baseline_score":     baseline_score,
+        "tuned_score":        tuned_score,
+        "improvement":        improvement,
+        "verdict":            verdict,
+        "param_explanations": f"Best ARIMA order: p={best_order[0]}, d={best_order[1]}, q={best_order[2]}.",
+        "model_path":         str(tuned_path),
+        "decisions_required": [],
+        "decisions_made":     [],
+        "plain_english_summary": summary,
+        "report_section": {
+            "stage":   "tuning",
+            "title":   "Fine-Tuning the Model",
+            "summary": summary,
+            "decision_made": f"Grid search over ARIMA(p,d,q). Best order: {best_order}.",
+            "why_this_matters": (
+                "Choosing the right ARIMA order controls how many past values and error terms "
+                "the model learns from. The best order minimises forecast error on held-out data."
+            )
+        },
+        "config_updates": {
+            "tuned_model_path": str(tuned_path),
+            "best_params":      best_params,
+            "tuned_score":      tuned_score
+        }
+    }
+
+
 def run(session: dict, decisions: dict) -> dict:
-    session_id   = session["session_id"]
-    task_type    = session["goal"].get("task_type", "binary_classification")
-    model_id     = session["config"].get("model_id")
+    session_id    = session["session_id"]
+    task_type     = session["goal"].get("task_type", "binary_classification")
+    model_id      = session["config"].get("model_id")
+    is_ts         = session.get("config", {}).get("is_time_series", False)
     class_weights = session["config"].get("class_weights")
-    sessions_dir = Path("sessions")
-    session_dir  = sessions_dir / session_id
-    splits_dir   = session_dir / "data" / "processed" / "splits"
+    sessions_dir  = Path("sessions")
+    session_dir   = sessions_dir / session_id
+    splits_dir    = session_dir / "data" / "processed" / "splits"
 
     if not model_id:
         return {
@@ -174,6 +324,62 @@ def run(session: dict, decisions: dict) -> dict:
             "plain_english_summary": "No trained model found in session config. Please run training first."
         }
 
+    # ---- ARIMA: dedicated grid search, no Optuna -------------------------
+    if model_id == "arima" or (is_ts and model_id == "arima"):
+        return _tune_arima(session_id, session_dir, splits_dir)
+
+    # ---- Prophet: skip tuning entirely ------------------------------------
+    if model_id == "prophet":
+        # Point tuned_model.pkl at the existing trained model so downstream
+        # stages (evaluation, explainability) continue to work unchanged.
+        models_dir = session_dir / "models"
+        best_json  = models_dir / "best_model.json"
+        tuned_path = models_dir / "tuned_model.pkl"
+        if best_json.exists():
+            with open(best_json) as f:
+                info = json.load(f)
+            with open(info["model_path"], "rb") as f:
+                existing_model = pickle.load(f)
+            with open(tuned_path, "wb") as f:
+                pickle.dump(existing_model, f)
+
+        summary = (
+            "Prophet works best with its default settings for most datasets. "
+            "No hyperparameter tuning was applied — the model from the training stage will be used."
+        )
+        return {
+            "stage":              "tuning",
+            "status":             "success",
+            "model_id":           "prophet",
+            "n_trials_run":       0,
+            "best_params":        {},
+            "baseline_score":     None,
+            "tuned_score":        None,
+            "improvement":        0,
+            "verdict":            "skipped",
+            "param_explanations": "No tuning applied.",
+            "model_path":         str(tuned_path) if best_json.exists() else None,
+            "decisions_required": [],
+            "decisions_made":     [],
+            "plain_english_summary": summary,
+            "report_section": {
+                "stage":   "tuning",
+                "title":   "Fine-Tuning the Model",
+                "summary": summary,
+                "decision_made": "Tuning skipped for Prophet.",
+                "why_this_matters": (
+                    "Prophet's built-in seasonality and trend components are already well-calibrated "
+                    "for most time series problems. Additional tuning rarely improves accuracy."
+                )
+            },
+            "config_updates": {
+                "tuned_model_path": str(tuned_path) if best_json.exists() else None,
+                "best_params":      {},
+                "tuned_score":      None
+            }
+        }
+
+    # ---- All other models: existing Optuna logic --------------------------
     try:
         X_train = pd.read_csv(splits_dir / "X_train.csv")
         X_val   = pd.read_csv(splits_dir / "X_val.csv")
@@ -222,7 +428,6 @@ def run(session: dict, decisions: dict) -> dict:
             eval_result = json.load(f)
         baseline_score = eval_result.get("config_updates", {}).get("primary_metric_value")
     if baseline_score is None:
-        # Compute directly from val set using the same metric as scoring below
         best_json = session_dir / "models" / "best_model.json"
         if best_json.exists():
             with open(best_json) as f:
