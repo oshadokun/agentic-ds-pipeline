@@ -10,6 +10,79 @@ alternatives with honest tradeoffs. No technical knowledge is required to use it
 
 ---
 
+## Current State (as of March 2026)
+
+The full 14-stage pipeline is **working end-to-end**:
+
+```
+Goal Capture → Data Load → Validation → EDA → Cleaning →
+Feature Engineering → Scaling → Splitting → Training →
+Evaluation → Tuning → Explainability (SHAP) → Deployment → Monitoring
+```
+
+### What works
+
+**Pipeline flow**
+- All 14 stages complete without errors on classification and regression datasets
+- Session state persists across browser refreshes; stages can be re-run
+- Report download generated client-side after monitoring
+
+**EDA**
+- When 3+ columns share the same issue, they are grouped into a single decision card
+  (e.g. "27 columns with extreme values — how would you like to handle them?")
+- ID-like columns (3+) grouped into a single exclusion card
+
+**Cleaning**
+- EDA outlier decisions are carried forward — cleaning never re-asks about
+  columns already decided in EDA
+- "What we did" summary groups repeated actions into a single collapsed line
+  (e.g. "Capped extreme values in 25 columns (V1, V2, V3… and 22 more)")
+  with a "show all / show less" toggle
+- SMOTE applied for imbalanced classification when minority class < 30%
+
+**Scaling (Normalisation)**
+- Two-phase model-aware flow: first asks which model the user plans to use,
+  then recommends the appropriate scaling method
+  - Tree models (Random Forest, XGBoost, Decision Tree) → No scaling
+  - Linear / Logistic Regression, KNN, SVM → Standard scaling
+  - Neural Network → Min-Max scaling
+  - ARIMA / Prophet → No scaling
+  - Not decided yet → Standard scaling (safe fallback)
+
+**Splitting**
+- User-adjustable train / validation / test sliders; always sum to 100%
+- Row counts shown in real time based on dataset size
+- Recommended ratios pre-filled from backend (based on dataset size)
+- Confirmed ratios correctly passed to the backend split call
+
+**Evaluation**
+- Classification metrics: Accuracy, Precision, Recall, F1, AUC-ROC, AUC-PR,
+  MCC, Specificity, Log Loss, Confusion Matrix
+- Regression metrics: MAE, RMSE, R², MAPE
+- Time series metrics: MAE and RMSE only (no R²)
+- Confusion matrix rendered interactively with plain-English cell labels:
+  TN = "Correctly cleared", FP = "False alarm", FN = "Missed", TP = "Correctly identified"
+- Amber warning card when R² > 0.98 (possible data leakage)
+- Amber warning card when AUC-ROC > 0.99 on imbalanced data
+- SMOTE float target values rounded to int before metrics (prevents sklearn crash)
+
+**Explainability**
+- Full SHAP waterfall and bar charts for all supported model types
+
+**Monitoring**
+- Drift detection on new data; report downloadable from the frontend
+
+### Known open issues
+
+| Issue | Status |
+|---|---|
+| Tuning before/after scores show 0.0000 for classification | In progress |
+| ROC curve occasionally unavailable (model wrapper mismatch) | In progress |
+| Lag feature screen appears for non-time-series datasets | Needs `is_time_series` guard in FeatureEngineeringView |
+| Cleaning stage grouped outlier card not always rendering (individual cards may show) | In progress |
+
+---
+
 ## For Claude Code — Read This First
 
 You are building this application. This README is your master brief.
@@ -487,7 +560,8 @@ cd frontend
 npm run dev
 ```
 
-The app is then available at `http://localhost:5173`
+The app is then available at `http://localhost:5175`
+(Vite will auto-select the next available port if 5173/5174 are in use.)
 
 ---
 

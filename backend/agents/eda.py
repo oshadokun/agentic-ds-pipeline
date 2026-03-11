@@ -354,50 +354,96 @@ def run(session: dict, decisions: dict) -> dict:
     decisions_made     = []
 
     if not decisions:
-        # Ask about ID-like columns
-        for col in high_card_cols:
+        # Ask about ID-like columns — group if 3+ share the same issue
+        if len(high_card_cols) >= 3:
             decisions_required.append({
-                "id":                    f"id_col__{col}",
-                "question":              f'Is "{col}" just an identifier (like a row number or code)?',
+                "id":                    "id_col__grouped",
+                "question":              f"We found {len(high_card_cols)} columns that look like identifiers (row IDs or codes). Should we exclude them?",
                 "recommendation":        "exclude",
                 "recommendation_reason": (
-                    f'"{col}" has nearly as many unique values as rows, which usually means '
-                    f"it's an ID or reference number — not useful for prediction."
+                    "These columns have nearly as many unique values as rows, which usually means "
+                    "they are ID or reference numbers — not useful for prediction."
                 ),
+                "grouped_columns":       high_card_cols,
                 "alternatives": [
-                    {"id": "exclude", "label": "Exclude it", "tradeoff": "Remove it from the model — recommended for ID columns"},
-                    {"id": "keep",    "label": "Keep it",    "tradeoff": "Include it — choose this if it genuinely carries meaning"}
+                    {"id": "exclude", "label": "Exclude all of them", "tradeoff": "Remove them from the model — recommended for ID columns"},
+                    {"id": "keep",    "label": "Keep all of them",    "tradeoff": "Include them — only if they genuinely carry meaning"}
                 ]
             })
-        # Ask about outlier handling for high-outlier numeric columns
-        for col in high_outlier_cols:
-            pct = next((f["outlier_pct"] for f in features if f["column"] == col), 0)
+        else:
+            for col in high_card_cols:
+                decisions_required.append({
+                    "id":                    f"id_col__{col}",
+                    "question":              f'Is "{col}" just an identifier (like a row number or code)?',
+                    "recommendation":        "exclude",
+                    "recommendation_reason": (
+                        f'"{col}" has nearly as many unique values as rows, which usually means '
+                        f"it's an ID or reference number — not useful for prediction."
+                    ),
+                    "alternatives": [
+                        {"id": "exclude", "label": "Exclude it", "tradeoff": "Remove it from the model — recommended for ID columns"},
+                        {"id": "keep",    "label": "Keep it",    "tradeoff": "Include it — choose this if it genuinely carries meaning"}
+                    ]
+                })
+
+        # Ask about outlier handling — group if 3+ columns share the same recommendation
+        if len(high_outlier_cols) >= 3:
             decisions_required.append({
-                "id":                    f"outliers__{col}",
-                "question":              f'How should we handle the extreme values in "{col}"?',
+                "id":                    "outliers__grouped",
+                "question":              f"We found {len(high_outlier_cols)} columns with extreme values. How would you like to handle them?",
                 "recommendation":        "cap",
                 "recommendation_reason": (
-                    f'"{col}" has {pct:.1%} of values that are unusually high or low. '
-                    f"These can skew the model if left untreated."
+                    f"These {len(high_outlier_cols)} columns each have an unusual number of very high "
+                    f"or very low values. Capping pulls them to the edge of the normal range without "
+                    f"removing any rows — the safest approach."
                 ),
+                "grouped_columns":       high_outlier_cols,
                 "alternatives": [
-                    {"id": "cap",    "label": "Cap at boundary",  "tradeoff": "Pull extreme values in to the edge of the normal range — usually the safest choice"},
-                    {"id": "remove", "label": "Remove those rows", "tradeoff": "Delete rows with extreme values — use if they are clearly errors"},
-                    {"id": "keep",   "label": "Keep as-is",        "tradeoff": "Leave them unchanged — choose if the extremes are real and meaningful"}
+                    {"id": "cap",    "label": "Cap at boundary (apply to all)",  "tradeoff": "Pull extreme values in to the edge of the normal range — usually the safest choice"},
+                    {"id": "remove", "label": "Remove those rows (apply to all)", "tradeoff": "Delete rows with extreme values — use if they are clearly errors"},
+                    {"id": "keep",   "label": "Keep as-is (apply to all)",        "tradeoff": "Leave them unchanged — choose if the extremes are real and meaningful"}
                 ]
             })
+        else:
+            for col in high_outlier_cols:
+                pct = next((f["outlier_pct"] for f in features if f["column"] == col), 0)
+                decisions_required.append({
+                    "id":                    f"outliers__{col}",
+                    "question":              f'How should we handle the extreme values in "{col}"?',
+                    "recommendation":        "cap",
+                    "recommendation_reason": (
+                        f'"{col}" has {pct:.1%} of values that are unusually high or low. '
+                        f"These can skew the model if left untreated."
+                    ),
+                    "alternatives": [
+                        {"id": "cap",    "label": "Cap at boundary",  "tradeoff": "Pull extreme values in to the edge of the normal range — usually the safest choice"},
+                        {"id": "remove", "label": "Remove those rows", "tradeoff": "Delete rows with extreme values — use if they are clearly errors"},
+                        {"id": "keep",   "label": "Keep as-is",        "tradeoff": "Leave them unchanged — choose if the extremes are real and meaningful"}
+                    ]
+                })
     else:
-        # Record decisions made
+        # Record decisions made — handle grouped and individual decisions
         for key, value in decisions.items():
-            col = key.split("__", 1)[-1]
-            if key.startswith("id_col__"):
+            if key == "id_col__grouped":
                 label = "Excluded" if value == "exclude" else "Kept"
-                decisions_made.append({"column": col, "decision_type": "id_column", "value": value,
-                                       "plain_english": f'{label} "{col}" (ID column handling)'})
-            elif key.startswith("outliers__"):
+                for col in high_card_cols:
+                    decisions_made.append({"column": col, "decision_type": "id_column", "value": value,
+                                           "plain_english": f'{label} "{col}" (grouped ID column handling)'})
+            elif key == "outliers__grouped":
                 label = {"cap": "Cap at boundary", "remove": "Remove rows", "keep": "Keep as-is"}.get(value, value)
-                decisions_made.append({"column": col, "decision_type": "outlier_handling", "value": value,
-                                       "plain_english": f'"{col}" outliers: {label}'})
+                for col in high_outlier_cols:
+                    decisions_made.append({"column": col, "decision_type": "outlier_handling", "value": value,
+                                           "plain_english": f'"{col}" outliers: {label} (grouped)'})
+            else:
+                col = key.split("__", 1)[-1]
+                if key.startswith("id_col__"):
+                    label = "Excluded" if value == "exclude" else "Kept"
+                    decisions_made.append({"column": col, "decision_type": "id_column", "value": value,
+                                           "plain_english": f'{label} "{col}" (ID column handling)'})
+                elif key.startswith("outliers__"):
+                    label = {"cap": "Cap at boundary", "remove": "Remove rows", "keep": "Keep as-is"}.get(value, value)
+                    decisions_made.append({"column": col, "decision_type": "outlier_handling", "value": value,
+                                           "plain_english": f'"{col}" outliers: {label}'})
 
     if decisions_required:
         summary = (

@@ -19,10 +19,10 @@ function cellColour(row, col, value, maxVal) {
 }
 
 function binaryLabel(row, col) {
-  if (row === 0 && col === 0) return "True Negative"
-  if (row === 0 && col === 1) return "False Positive"
-  if (row === 1 && col === 0) return "False Negative"
-  if (row === 1 && col === 1) return "True Positive"
+  if (row === 0 && col === 0) return "Correctly cleared"
+  if (row === 0 && col === 1) return "False alarm"
+  if (row === 1 && col === 0) return "Missed"
+  if (row === 1 && col === 1) return "Correctly identified"
 }
 
 function binaryDescription(row, col, count, total, classNames) {

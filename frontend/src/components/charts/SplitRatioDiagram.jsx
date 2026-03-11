@@ -44,13 +44,20 @@ function SliderRow({ label, value, min, max, colour, onChange, hint, disabled })
 export default function SplitRatioDiagram({
   totalRows = 0,
   onChange,
+  defaultRatios = null,   // { train, val, test } as percentages (0-100) — overrides initialTrain/initialVal
   initialTrain = 75,
   initialVal   = 10,
   disabled     = false
 }) {
-  const [trainPct, setTrainPct] = useState(initialTrain)
-  const [valPct,   setValPct]   = useState(initialVal)
+  const [trainPct, setTrainPct] = useState(defaultRatios?.train ?? initialTrain)
+  const [valPct,   setValPct]   = useState(defaultRatios?.val   ?? initialVal)
   const testPct = 100 - trainPct - valPct
+
+  // Sync internal state when defaultRatios prop changes (e.g. after async API response)
+  useEffect(() => {
+    if (defaultRatios?.train != null) setTrainPct(defaultRatios.train)
+    if (defaultRatios?.val   != null) setValPct(defaultRatios.val)
+  }, [defaultRatios?.train, defaultRatios?.val])  // eslint-disable-line
 
   const counts = useMemo(() => ({
     train: Math.round(totalRows * trainPct / 100),

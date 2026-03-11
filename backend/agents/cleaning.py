@@ -168,15 +168,15 @@ def _handle_outliers(df: pd.DataFrame, col: str, strategy: str) -> tuple[pd.Data
 
     if strategy == "cap":
         df[col] = df[col].clip(lower=lower, upper=upper)
-        return df, f"Capped {count} extreme values in '{col}' at the boundary values ({lower:.2f} to {upper:.2f})."
+        return df, f"Capped extreme values in '{col}'"
 
     elif strategy == "remove":
         before = len(df)
         df     = df[~mask]
-        return df, f"Removed {before - len(df)} rows with extreme values in '{col}'."
+        return df, f"Removed rows with extreme values in '{col}'"
 
     elif strategy == "keep":
-        return df, f"Kept extreme values in '{col}' as-is ({count} values outside the normal range)."
+        return df, f"Kept extreme values in '{col}' as-is"
 
     return df, f"No outlier handling applied to '{col}'."
 
@@ -219,7 +219,7 @@ def _recommend_impute(col: str, df: pd.DataFrame, missing_pct: float) -> tuple[s
 # ---------------------------------------------------------------------------
 
 def _build_decisions_required(df: pd.DataFrame, target_col: str,
-                                eda_findings: dict) -> list:
+                                eda_findings: dict, task_type: str = "") -> list:
     decisions = []
     missing   = df.isna().mean()
 
@@ -244,9 +244,12 @@ def _build_decisions_required(df: pd.DataFrame, target_col: str,
                 "alternatives":         alternatives
             })
 
-    # Outlier decisions — only for columns with > 1% outliers
-    outlier_cols = eda_findings.get("high_outlier_cols", [])
-    for col in outlier_cols:
+    # Outlier decisions — skip columns already decided in the EDA stage
+    outlier_cols            = eda_findings.get("high_outlier_cols", [])
+    eda_outlier_strategy    = eda_findings.get("outlier_strategy", {})
+    undecided_outlier_cols  = [c for c in outlier_cols if c not in eda_outlier_strategy]
+
+    for col in undecided_outlier_cols:
         if col not in df.columns or df[col].dtype not in ["int64", "float64"]:
             continue
         Q1, Q3  = df[col].quantile([0.25, 0.75])
@@ -267,6 +270,41 @@ def _build_decisions_required(df: pd.DataFrame, target_col: str,
                     {"id": "cap",    "label": "Cap at the boundary values (recommended)", "tradeoff": "Keeps all rows but limits extreme values."},
                     {"id": "remove", "label": "Remove rows with extreme values",          "tradeoff": "Cleaner data but you lose rows."},
                     {"id": "keep",   "label": "Keep as-is",                               "tradeoff": "No data lost but extreme values may affect the model."}
+                ]
+            })
+
+    # Class imbalance — classification only
+    if "classification" in task_type and target_col and target_col in df.columns:
+        vc          = df[target_col].value_counts(normalize=True)
+        minority_pct = float(vc.min())
+        majority_pct = float(vc.max())
+        if minority_pct < 0.30:
+            decisions.append({
+                "id":    "balance_classes",
+                "type":  "class_imbalance",
+                "column": target_col,
+                "minority_pct": round(minority_pct, 4),
+                "majority_pct": round(majority_pct, 4),
+                "question": (
+                    f"Your data has imbalanced classes — {minority_pct:.0%} vs {majority_pct:.0%}. "
+                    f"Would you like us to balance them?"
+                ),
+                "recommendation": "smote",
+                "recommendation_reason": (
+                    "When one outcome is much rarer than another, the model tends to ignore it. "
+                    "Balancing creates synthetic examples of the minority class so the model learns both equally."
+                ),
+                "alternatives": [
+                    {
+                        "id":       "smote",
+                        "label":    "Yes — balance my data (Recommended)",
+                        "tradeoff": "Adds synthetic rows to the minority class. May slightly reduce overall accuracy but improves detection of the rarer outcome."
+                    },
+                    {
+                        "id":       "none",
+                        "label":    "No — leave as-is",
+                        "tradeoff": "The model may struggle to predict the rarer outcome correctly."
+                    }
                 ]
             })
 
@@ -297,6 +335,7 @@ def _build_decisions_required(df: pd.DataFrame, target_col: str,
 def run(session: dict, decisions: dict) -> dict:
     session_id   = session["session_id"]
     target_col   = session["goal"].get("target_column")
+    task_type    = session["goal"].get("task_type", "")
     sessions_dir = Path("sessions")
     session_dir  = sessions_dir / session_id
 
@@ -321,7 +360,7 @@ def run(session: dict, decisions: dict) -> dict:
 
     # If the frontend is only asking for decisions_required (no user decisions yet)
     if not decisions or decisions.get("phase") == "request_decisions":
-        dr = _build_decisions_required(df, target_col, eda_findings)
+        dr = _build_decisions_required(df, target_col, eda_findings, task_type)
         if dr:
             return {
                 "stage":              "cleaning",
@@ -373,12 +412,17 @@ def run(session: dict, decisions: dict) -> dict:
             df, msg = _apply_imputation(df, col, strategy)
             actions_log.append(msg)
 
-    # 5. Outliers — user decisions
-    outlier_decisions = {
-        k.replace("outlier_", ""): v
-        for k, v in decisions.items()
-        if k.startswith("outlier_")
-    }
+    # 5. Outliers — start from EDA decisions, overlay any cleaning-stage decisions
+    outlier_decisions = dict(eda_findings.get("outlier_strategy", {}))
+    # Expand grouped EDA decision: outliers__grouped → per-column strategy
+    if "outliers__grouped" in decisions:
+        grouped_strategy = decisions["outliers__grouped"]
+        for col in eda_findings.get("high_outlier_cols", []):
+            outlier_decisions.setdefault(col, grouped_strategy)
+    # Overlay per-column decisions confirmed during cleaning
+    for k, v in decisions.items():
+        if k.startswith("outlier_"):
+            outlier_decisions[k.replace("outlier_", "", 1)] = v
     # Auto-cap minor outliers (< 1%)
     for col in df.select_dtypes("number").columns:
         if col == target_col or col in outlier_decisions:
@@ -396,6 +440,25 @@ def run(session: dict, decisions: dict) -> dict:
         if col in df.columns:
             df, msg = _handle_outliers(df, col, strategy)
             actions_log.append(msg)
+
+    # 6. Class imbalance — record user decision; SMOTE is applied in training.py
+    #    after the data is split, so it only affects the training split.
+    balance_choice        = decisions.get("balance_classes", "none")
+    class_imbalance_found = False
+    imbalance_note        = ""
+    if "classification" in task_type and target_col and target_col in df.columns:
+        vc           = df[target_col].value_counts(normalize=True)
+        minority_pct = float(vc.min())
+        majority_pct = float(vc.max())
+        if minority_pct < 0.30:
+            class_imbalance_found = True
+            if balance_choice == "smote":
+                imbalance_note = (
+                    f"Your data had imbalanced classes ({minority_pct:.0%} vs {majority_pct:.0%}). "
+                    f"We will create synthetic examples of the minority class to help the model "
+                    f"learn both outcomes equally."
+                )
+                actions_log.append(imbalance_note)
 
     # Save cleaned data
     output_path = session_dir / "data" / "interim" / "cleaned.csv"
@@ -434,8 +497,10 @@ def run(session: dict, decisions: dict) -> dict:
             )
         },
         "config_updates": {
-            "impute_strategies":  missing_decisions,
-            "outlier_strategies": outlier_decisions,
-            "rows_removed":       rows_before - rows_after
+            "impute_strategies":       missing_decisions,
+            "outlier_strategies":      outlier_decisions,
+            "rows_removed":            rows_before - rows_after,
+            "class_imbalance_detected": class_imbalance_found,
+            "imbalance_strategy":      balance_choice if class_imbalance_found else "none"
         }
     }

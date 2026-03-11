@@ -23,6 +23,28 @@ TASK_TYPES_NOT_REQUIRING_SCALING = [
     "time_series", "forecast", "time_series_forecast",
 ]
 
+# Model options shown to the user — includes recommended scaling for each
+MODEL_OPTIONS = [
+    {"id": "random_forest",      "label": "Random Forest",                      "scaling": "none",     "group": "tree"},
+    {"id": "xgboost",            "label": "XGBoost / Gradient Boosting",         "scaling": "none",     "group": "tree"},
+    {"id": "decision_tree",      "label": "Decision Tree",                       "scaling": "none",     "group": "tree"},
+    {"id": "linear_regression",  "label": "Linear / Ridge Regression",           "scaling": "standard", "group": "linear"},
+    {"id": "logistic_regression","label": "Logistic Regression",                 "scaling": "standard", "group": "linear"},
+    {"id": "knn",                "label": "K-Nearest Neighbours (KNN)",          "scaling": "standard", "group": "distance"},
+    {"id": "svm",                "label": "Support Vector Machine (SVM)",        "scaling": "standard", "group": "distance"},
+    {"id": "neural_network",     "label": "Neural Network",                      "scaling": "minmax",   "group": "neural"},
+    {"id": "arima_prophet",      "label": "ARIMA / Prophet (time series model)", "scaling": "none",     "group": "timeseries"},
+    {"id": "not_decided",        "label": "Not decided yet",                     "scaling": "standard", "group": "unknown"},
+]
+MODEL_SCALING_MAP = {m["id"]: m["scaling"] for m in MODEL_OPTIONS}
+MODEL_GROUP_MAP   = {m["id"]: m["group"]   for m in MODEL_OPTIONS}
+
+_SCALING_NONE_REASONS = {
+    "tree":       "Tree-based models (like Random Forest and XGBoost) split on value thresholds — the scale of the data doesn't affect their decisions, so no scaling is needed.",
+    "timeseries": "Time series models work directly on raw values. Scaling would make error metrics like MAE harder to interpret.",
+    "unknown":    "No scaling applied.",
+}
+
 SCALING_STRATEGIES = {
     "standard": {
         "label":     "Standard scaling — centre around zero with consistent spread (recommended default)",
@@ -172,29 +194,75 @@ def run(session: dict, decisions: dict) -> dict:
         if c not in skip_cols and c != target_col
     ]
 
-    # Return decision options if not yet provided
-    if not decisions or decisions.get("phase") == "request_decisions":
-        try:
-            rec, reason = _recommend_strategy(df, numeric_cols, task_type)
-        except Exception:
-            rec, reason = "standard", "Standard scaling is the most widely used approach and works well for most data."
-        if rec == "none":
-            intro = (
-                "Based on your goal type, scaling is not required for this pipeline. "
-                "You can still choose a different approach below if you prefer."
-            )
-        else:
-            intro = (
-                "Some of your columns have very different value ranges. We need to put them on "
-                "a comparable scale so the model treats them fairly. Here is what we recommend:"
-            )
+    # Check for stored model preference from a previous session choice
+    stored_model = session.get("config", {}).get("model_preference")
+    model_preference = decisions.get("model_preference") or stored_model
+
+    # ── Phase 1: Ask which model the user is planning to use ──────────────────
+    if not model_preference and "scaling_strategy" not in decisions:
         return {
             "stage":  "normalisation",
             "status": "decisions_required",
             "decisions_required": [{
-                "id":                   "scaling_strategy",
-                "question":             "How would you like to scale your numeric columns?",
-                "recommendation":       rec,
+                "id":                    "model_preference",
+                "question":              "Which model are you planning to use?",
+                "recommendation":        None,
+                "recommendation_reason": (
+                    "Your choice of model affects which scaling approach is best. "
+                    "Some models (like Random Forest) don't need scaling at all."
+                ),
+                "alternatives": [
+                    {"id": m["id"], "label": m["label"],
+                     "tradeoff": _SCALING_NONE_REASONS.get(m["group"], "")
+                                 or SCALING_STRATEGIES.get(m["scaling"], {}).get("best_for", "")}
+                    for m in MODEL_OPTIONS
+                ]
+            }],
+            "plain_english_summary": (
+                "Before we scale your data, we need to know which model you're planning to use — "
+                "different models have different requirements."
+            )
+        }
+
+    # ── Phase 2: Recommend scaling based on chosen model ─────────────────────
+    if model_preference and "scaling_strategy" not in decisions:
+        model_rec = MODEL_SCALING_MAP.get(model_preference, "standard")
+        model_grp = MODEL_GROUP_MAP.get(model_preference, "unknown")
+
+        if model_rec == "none":
+            rec    = "none"
+            reason = _SCALING_NONE_REASONS.get(model_grp, "This model type doesn't require scaling.")
+            intro  = (
+                "Based on your model choice, scaling is not required for this pipeline. "
+                "You can still choose a different approach below if you prefer."
+            )
+        elif model_rec == "minmax":
+            rec    = "minmax"
+            reason = "Neural networks work best when inputs are in a bounded 0-to-1 range. Min-Max scaling achieves this."
+            intro  = (
+                "Neural networks require inputs in a bounded range. We'll scale your columns to 0-to-1."
+            )
+        else:
+            # model suggests standard — let data heuristics refine (robust/power if needed)
+            try:
+                data_rec, data_reason = _recommend_strategy(df, numeric_cols, task_type)
+            except Exception:
+                data_rec, data_reason = "standard", "Standard scaling is the most widely used approach."
+            rec    = data_rec  # may be robust/power if data warrants it
+            reason = data_reason
+            intro  = (
+                "Some of your columns have very different value ranges. "
+                "Here is what we recommend based on your model choice and data:"
+            )
+
+        return {
+            "stage":  "normalisation",
+            "status": "decisions_required",
+            "model_preference": model_preference,
+            "decisions_required": [{
+                "id":                    "scaling_strategy",
+                "question":              "How would you like to scale your numeric columns?",
+                "recommendation":        rec,
                 "recommendation_reason": reason,
                 "alternatives": [
                     {"id": k, **{kk: vv for kk, vv in v.items()}}
@@ -204,7 +272,7 @@ def run(session: dict, decisions: dict) -> dict:
             "plain_english_summary": intro
         }
 
-    strategy = decisions.get("scaling_strategy", "standard")
+    strategy = decisions.get("scaling_strategy") or "standard"
 
     if not numeric_cols or strategy == "none":
         # No scaling — just copy features.csv to scaled.csv
@@ -234,7 +302,8 @@ def run(session: dict, decisions: dict) -> dict:
             "config_updates": {
                 "scaling_strategy": "none",
                 "scaled_columns":   [],
-                "scaler_path":      None
+                "scaler_path":      None,
+                "model_preference": model_preference
             }
         }
 
@@ -294,6 +363,7 @@ def run(session: dict, decisions: dict) -> dict:
         "config_updates": {
             "scaling_strategy": strategy,
             "scaled_columns":   numeric_cols,
-            "scaler_path":      str(scaler_path)
+            "scaler_path":      str(scaler_path),
+            "model_preference": model_preference
         }
     }

@@ -6,6 +6,7 @@ Test set is evaluated exactly once — at the final evaluation after tuning.
 
 import json
 import pickle
+import traceback
 from pathlib import Path
 
 import matplotlib
@@ -17,7 +18,8 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, average_precision_score, confusion_matrix,
     mean_squared_error, mean_absolute_error, r2_score,
-    RocCurveDisplay, ConfusionMatrixDisplay
+    matthews_corrcoef, log_loss,
+    RocCurveDisplay
 )
 
 
@@ -26,7 +28,16 @@ from sklearn.metrics import (
 # ---------------------------------------------------------------------------
 
 def _evaluate_classifier(model, X, y, task_type: str) -> dict:
-    y_pred  = model.predict(X)
+    # Cast to float64 to avoid dtype errors from mixed-type feature DataFrames
+    try:
+        X = X.astype(np.float64)
+    except Exception:
+        pass
+
+    # Round to integers — SMOTE can produce continuous float target values
+    y      = np.array(y).round().astype(int)
+    y_pred = np.array(model.predict(X)).round().astype(int)
+
     y_proba = None
     if hasattr(model, "predict_proba"):
         try:
@@ -42,6 +53,12 @@ def _evaluate_classifier(model, X, y, task_type: str) -> dict:
         "confusion_matrix": confusion_matrix(y, y_pred).tolist()
     }
 
+    # MCC — works for both binary and multiclass
+    try:
+        results["mcc"] = round(float(matthews_corrcoef(y, y_pred)), 4)
+    except Exception:
+        pass
+
     if y_proba is not None and task_type == "binary_classification":
         y_prob_pos = y_proba[:, 1]
         try:
@@ -49,21 +66,52 @@ def _evaluate_classifier(model, X, y, task_type: str) -> dict:
             results["pr_auc"]  = round(float(average_precision_score(y, y_prob_pos)), 4)
         except Exception:
             pass
+        try:
+            results["log_loss"] = round(float(log_loss(y, y_proba)), 4)
+        except Exception:
+            pass
+        # Specificity (binary only): TN / (TN + FP)
+        try:
+            cm = confusion_matrix(y, y_pred)
+            if cm.shape == (2, 2):
+                tn, fp = int(cm[0][0]), int(cm[0][1])
+                results["specificity"] = round(float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0, 4)
+        except Exception:
+            pass
 
     return results
 
 
 def _evaluate_regressor(model, X, y) -> dict:
+    try:
+        X = X.astype(np.float64)
+    except Exception:
+        pass
     y_pred = model.predict(X)
-    return {
-        "rmse": round(float(np.sqrt(mean_squared_error(y, y_pred))), 4),
+    result = {
         "mae":  round(float(mean_absolute_error(y, y_pred)), 4),
+        "rmse": round(float(np.sqrt(mean_squared_error(y, y_pred))), 4),
         "r2":   round(float(r2_score(y, y_pred)), 4),
     }
+    # MAPE — skip rows where actual is zero to avoid division by zero
+    try:
+        y_arr  = np.array(y, dtype=float)
+        yp_arr = np.array(y_pred, dtype=float)
+        mask   = y_arr != 0
+        if mask.sum() > 0:
+            mape = float(np.mean(np.abs((y_arr[mask] - yp_arr[mask]) / y_arr[mask]))) * 100
+            result["mape"] = round(mape, 4)
+    except Exception:
+        pass
+    return result
 
 
 def _evaluate_time_series_model(model, X, y) -> dict:
     """For ARIMA / Prophet: MAE and RMSE only — no R², no raw predictions array."""
+    try:
+        X = X.astype(np.float64)
+    except Exception:
+        pass
     y_vals = y.values if hasattr(y, "values") else np.array(y)
     y_pred = model.predict(X)
     return {
@@ -221,20 +269,6 @@ def _interpret_confusion_matrix(cm: list, class_names: list) -> str:
 # Chart generation
 # ---------------------------------------------------------------------------
 
-def _plot_confusion_matrix(model, X, y, class_names, output_dir: str) -> str:
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ConfusionMatrixDisplay.from_estimator(
-        model, X, y,
-        display_labels=class_names,
-        cmap="Blues", ax=ax
-    )
-    ax.set_title("Confusion Matrix — What the model predicted vs what actually happened")
-    plt.tight_layout()
-    path = Path(output_dir) / "confusion_matrix.png"
-    plt.savefig(path, bbox_inches="tight", dpi=100)
-    plt.close()
-    return str(path)
-
 
 def _plot_roc(model, X, y, output_dir: str) -> str:
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -301,6 +335,20 @@ def _plot_residuals(y_true, y_pred, output_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run(session: dict, decisions: dict) -> dict:
+    try:
+        return _run(session, decisions)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[evaluation] UNHANDLED ERROR:\n{tb}")
+        return {
+            "stage":                 "evaluation",
+            "status":                "failed",
+            "plain_english_summary": f"Evaluation failed: {exc}",
+            "error_detail":          tb,
+        }
+
+
+def _run(session: dict, decisions: dict) -> dict:
     session_id        = session["session_id"]
     target_col        = session["goal"].get("target_column")
     task_type         = session["goal"].get("task_type", "binary_classification")
@@ -356,6 +404,8 @@ def run(session: dict, decisions: dict) -> dict:
 
     # Compute metrics
     time_series_data = None
+    high_r2_warning  = False
+    high_auc_warning = False
     is_time_series_model = (
         is_ts or
         model.__class__.__name__ in ("ARIMAWrapper", "ProphetWrapper") or
@@ -366,9 +416,10 @@ def run(session: dict, decisions: dict) -> dict:
 
     if "classification" in task_type:
         metrics = _evaluate_classifier(model, X_eval, y_eval, task_type)
-        charts  = [
-            _plot_confusion_matrix(model, X_eval, y_eval, class_names, str(output_dir)),
-        ]
+        # Warn on suspiciously high AUC-ROC for imbalanced datasets
+        if class_imbalance and metrics.get("roc_auc", 0) > 0.99:
+            high_auc_warning = True
+        charts = []
         if task_type == "binary_classification":
             charts.append(_plot_roc(model, X_eval, y_eval, str(output_dir)))
 
@@ -388,6 +439,8 @@ def run(session: dict, decisions: dict) -> dict:
 
     else:
         metrics = _evaluate_regressor(model, X_eval, y_eval)
+        if metrics.get("r2", 0) > 0.98:
+            high_r2_warning = bool(True)
         y_pred  = model.predict(X_eval)
         y_true_list = y_eval.tolist()
         y_pred_list = [float(v) for v in y_pred]
@@ -429,6 +482,8 @@ def run(session: dict, decisions: dict) -> dict:
         "split_evaluated":           split_name,
         "metrics":                   metrics,
         "is_time_series":            is_time_series_model,
+        "high_r2_warning":           bool(high_r2_warning),
+        "high_auc_warning":          bool(high_auc_warning),
         "interpretations":           interpretations,
         "verdict":                   verdict,
         "verdict_message":           verdict_msg,

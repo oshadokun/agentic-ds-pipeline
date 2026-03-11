@@ -128,18 +128,11 @@ export default function CleaningView() {
             </div>
           )}
 
-          {/* Actions log */}
+          {/* Actions log — grouped by action type */}
           {result.actions_taken?.length > 0 && (
             <div>
               <p className="text-sm font-medium text-gray-700 mb-2">What we did</p>
-              <ul className="space-y-1.5">
-                {result.actions_taken.map((action, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-gray-600">
-                    <span className="text-green-500 mt-0.5 flex-shrink-0">✓</span>
-                    <span>{typeof action === "string" ? action : action.plain_english}</span>
-                  </li>
-                ))}
-              </ul>
+              <GroupedActionList actions={result.actions_taken} />
             </div>
           )}
         </div>
@@ -151,6 +144,82 @@ export default function CleaningView() {
         continueLabel="Continue to Prepare Features"
       />
     </div>
+  )
+}
+
+// Groups cleaning action strings by their action-type prefix.
+// Uses regex to extract "action verb phrase in 'ColumnName'" so varying
+// numeric suffixes (e.g. "Capped 5 extreme values…" vs "Capped 12…") don't
+// prevent grouping — the prefix is canonicalised to whatever precedes " in '".
+function buildGroups(actions) {
+  const texts  = actions.map(a => typeof a === "string" ? a : (a?.plain_english ?? String(a)))
+  const groups = new Map()
+  texts.forEach((text, i) => {
+    const m = text.match(/^(.+) in '([^']+)'/)
+    if (m) {
+      const prefix = m[1]
+      const col    = m[2]
+      if (!groups.has(prefix)) groups.set(prefix, { cols: [], firstIndex: i })
+      groups.get(prefix).cols.push(col)
+    } else {
+      groups.set(`__single__${i}`, { cols: [], firstIndex: i, single: text })
+    }
+  })
+  return [...groups.entries()].sort((a, b) => a[1].firstIndex - b[1].firstIndex)
+}
+
+function GroupedActionList({ actions }) {
+  const [expanded, setExpanded] = useState({})
+  const sorted = buildGroups(actions)
+
+  return (
+    <ul className="space-y-1.5">
+      {sorted.map(([key, { cols, single }], i) => {
+        const isSingle = single !== undefined
+        const isGroup  = !isSingle && cols.length > 1
+        const shown    = cols.slice(0, 3).join(", ")
+        const rest     = cols.length - 3
+        const isExpanded = expanded[i]
+
+        let lineText
+        if (isSingle) {
+          lineText = single
+        } else if (cols.length === 1) {
+          lineText = `${key} in '${cols[0]}'`
+        } else {
+          lineText = rest > 0
+            ? `${key} in ${cols.length} columns (${shown}, and ${rest} more)`
+            : `${key} in ${cols.length} columns (${shown})`
+        }
+
+        return (
+          <li key={i} className="flex items-start gap-2 text-sm text-gray-600">
+            <span className="text-green-500 mt-0.5 flex-shrink-0">✓</span>
+            <span className="flex-1">
+              {lineText}
+              {isGroup && rest > 0 && (
+                <>
+                  {" "}
+                  <button
+                    onClick={() => setExpanded(e => ({ ...e, [i]: !e[i] }))}
+                    className="text-blue-500 hover:underline text-xs"
+                  >
+                    {isExpanded ? "show less" : "show all"}
+                  </button>
+                  {isExpanded && (
+                    <ul className="mt-1.5 ml-1 space-y-0.5">
+                      {cols.map((col, j) => (
+                        <li key={j} className="text-xs text-gray-400">• {col}</li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+            </span>
+          </li>
+        )
+      })}
+    </ul>
   )
 }
 

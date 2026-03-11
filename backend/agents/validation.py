@@ -305,6 +305,47 @@ def _run_validation(df: pd.DataFrame, target_col: str, task_type: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Data summary helper
+# ---------------------------------------------------------------------------
+
+def _build_data_summary(df: pd.DataFrame) -> dict:
+    """Build column list, numeric stats, and shape for the UI data summary panel."""
+    columns = []
+    for col in df.columns:
+        null_count = int(df[col].isna().sum())
+        columns.append({
+            "name":          col,
+            "dtype":         str(df[col].dtype),
+            "non_null_count": int(df[col].notna().sum()),
+            "null_count":    null_count,
+            "null_pct":      round(float(df[col].isna().mean()), 4),
+        })
+
+    numeric_stats = []
+    for col in df.select_dtypes("number").columns:
+        s = df[col].dropna()
+        if len(s) == 0:
+            continue
+        try:
+            numeric_stats.append({
+                "name":   col,
+                "min":    round(float(s.min()),    4),
+                "max":    round(float(s.max()),    4),
+                "mean":   round(float(s.mean()),   4),
+                "median": round(float(s.median()), 4),
+                "std":    round(float(s.std()),    4),
+            })
+        except Exception:
+            pass
+
+    return {
+        "shape":         {"rows": int(len(df)), "columns": int(len(df.columns))},
+        "columns":       columns,
+        "numeric_stats": numeric_stats,
+    }
+
+
+# ---------------------------------------------------------------------------
 # run()
 # ---------------------------------------------------------------------------
 
@@ -334,6 +375,9 @@ def run(session: dict, decisions: dict) -> dict:
         }
 
     df = pd.read_csv(data_path, low_memory=False)
+
+    # Build data summary from the full (unfiltered) dataframe
+    data_summary = _build_data_summary(df)
 
     # Drop rows where target is missing (for validation purposes)
     if target_col in df.columns:
@@ -445,6 +489,7 @@ def run(session: dict, decisions: dict) -> dict:
         "status":               overall,
         "output_data_path":     str(data_path),
         "validation_report":    report,
+        "data_summary":         data_summary,
         "decisions_required":   decisions_required,
         "decisions_made":       [],
         "plain_english_summary": summary,

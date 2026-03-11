@@ -14,9 +14,10 @@ export default function NormalisationView() {
     decisions, setDecisions
   } = usePipeline()
 
-  const [hasLoaded, setHasLoaded]   = useState(false)
-  const [confirmed, setConfirmed]   = useState(false)
-  const [applying, setApplying]     = useState(false)
+  const [hasLoaded, setHasLoaded]       = useState(false)
+  const [confirmedIds, setConfirmedIds] = useState({})
+  const [applying, setApplying]         = useState(false)
+  const [advancing, setAdvancing]       = useState(false)  // re-running to get scaling Q
 
   const stageStatus    = getStageStatus("normalisation")
   const isComplete     = stageStatus === "complete"
@@ -24,25 +25,35 @@ export default function NormalisationView() {
   const required       = result?.decisions_required ?? []
   const needsDecisions = required.length > 0 && result?.status === "decisions_required"
 
+  // Is this the model-preference phase or the scaling-strategy phase?
+  const isModelPhase   = required.length === 1 && required[0]?.id === "model_preference"
+  const isScalingPhase = required.some(d => d.id === "scaling_strategy")
+  const allConfirmed   = required.every(d => confirmedIds[d.id])
+
   useEffect(() => {
     async function load() {
-      let res
       if (isComplete) {
-        res = await loadStageResult("normalisation")
+        await loadStageResult("normalisation")
       } else {
-        res = await runStage("normalisation")
+        await runStage("normalisation")
       }
-      console.log("[NormalisationView] stage result:", res)
-      console.log("[NormalisationView] decisions_required:", res?.decisions_required)
-      console.log("[NormalisationView] recommendation:", res?.decisions_required?.[0]?.recommendation)
       setHasLoaded(true)
     }
     load()
   }, []) // eslint-disable-line
 
-  function handleConfirm(decisionId, value) {
+  async function handleConfirm(decisionId, value) {
+    const updatedDecisions = { ...decisions, [decisionId]: value }
     setDecisions({ [decisionId]: value })
-    setConfirmed(true)
+    setConfirmedIds(c => ({ ...c, [decisionId]: true }))
+
+    // After model is chosen, immediately re-run to get scaling recommendation
+    if (decisionId === "model_preference") {
+      setAdvancing(true)
+      await runStage("normalisation", updatedDecisions)
+      setAdvancing(false)
+      setConfirmedIds({})  // reset so user must confirm the scaling decision too
+    }
   }
 
   async function applyDecisions() {
@@ -51,12 +62,16 @@ export default function NormalisationView() {
     setApplying(false)
   }
 
-  if (stageRunning || applying) {
+  if (stageRunning || applying || advancing) {
     return (
       <div className="space-y-6">
         <StageHeader />
         <AgentRunning
-          stageName={applying ? "Scaling your data…" : "Checking data ranges…"}
+          stageName={
+            advancing ? "Updating scaling recommendation…"
+            : applying  ? "Scaling your data…"
+            : "Checking data ranges…"
+          }
           message="Fitting the scaler to your feature columns."
         />
       </div>
@@ -71,12 +86,12 @@ export default function NormalisationView() {
         <AlertBanner type="error" title="Scaling failed" message={stageError} />
       )}
 
-      {/* Scaler decision */}
+      {/* Decision phase */}
       {needsDecisions && hasLoaded && (
         <div className="space-y-4">
           <ExplanationPanel
             message={result.plain_english_summary ??
-              "Different features in your data are on very different scales — for example, age (18–80) and salary (20,000–200,000). Scaling brings them to a comparable range so the model doesn't unfairly weight the larger numbers."}
+              "Different features in your data are on very different scales. Scaling brings them to a comparable range so the model doesn't unfairly weight the larger numbers."}
           />
 
           {required.map(d => (
@@ -87,7 +102,8 @@ export default function NormalisationView() {
             />
           ))}
 
-          {confirmed && (
+          {/* Apply button shown only in scaling phase, after scaling choice confirmed */}
+          {isScalingPhase && allConfirmed && (
             <button
               onClick={applyDecisions}
               className="w-full py-3 rounded-xl bg-[#1B3A5C] text-white font-medium
@@ -123,18 +139,18 @@ export default function NormalisationView() {
           )}
 
           <div className="border border-gray-100 rounded-2xl p-5 bg-white shadow-sm space-y-3">
-            {result.scaler_type && (
+            {result.scaling_strategy && (
               <div className="flex items-center justify-between">
-                <span className="text-sm text-gray-500">Scaler used</span>
+                <span className="text-sm text-gray-500">Scaling applied</span>
                 <span className="text-sm font-semibold text-gray-800 capitalize">
-                  {result.scaler_type.replace("_", " ")}
+                  {result.scaling_strategy.replace(/_/g, " ")}
                 </span>
               </div>
             )}
-            {result.features_scaled !== undefined && (
+            {result.columns_scaled?.length > 0 && (
               <div className="flex items-center justify-between">
                 <span className="text-sm text-gray-500">Columns scaled</span>
-                <span className="text-sm font-semibold text-gray-800">{result.features_scaled}</span>
+                <span className="text-sm font-semibold text-gray-800">{result.columns_scaled.length}</span>
               </div>
             )}
             <p className="text-xs text-gray-400 pt-2 border-t border-gray-50">

@@ -55,11 +55,8 @@ export default function SplittingView() {
     setApplying(false)
   }
 
-  // Derive ratios from result or decisions
-  const splitRatioDecision = required.find(d => d.id === "split_ratios")
-  const defaultRatios = splitRatioDecision?.recommendation
-    ? parseRatios(splitRatioDecision.recommendation)
-    : { train: 70, val: 15, test: 15 }
+  // Derive recommended ratios from the backend response (percentages, e.g. {train:75,val:10,test:15})
+  const defaultRatios = result?.recommended_ratios ?? { train: 70, val: 15, test: 15 }
 
   if (stageRunning || applying) {
     return (
@@ -90,9 +87,13 @@ export default function SplittingView() {
 
           {/* Split ratio diagram */}
           <div className="border border-gray-100 rounded-2xl p-5 bg-white shadow-sm">
-            <h3 className="font-semibold text-gray-800 mb-4">Adjust your split ratios</h3>
+            <h3 className="font-semibold text-gray-800 mb-1">Adjust your split ratios</h3>
+            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200
+                           rounded-xl px-3 py-2 mb-4">
+              These are our recommended ratios based on your dataset size. You can adjust them freely below.
+            </p>
             <SplitRatioDiagram
-              defaultRatios={ratios ?? defaultRatios}
+              defaultRatios={defaultRatios}
               onChange={handleRatioChange}
               totalRows={result?.total_rows}
             />

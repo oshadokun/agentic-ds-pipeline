@@ -18,7 +18,7 @@ export default function TrainingView() {
     runStage, loadStageResult,
     stageRunning, stageResult, stageError,
     goToNextStage, getStageStatus,
-    decisions, setDecisions
+    decisions, setDecisions, clearStageError
   } = usePipeline()
 
   const [hasLoaded, setHasLoaded] = useState(false)
@@ -32,15 +32,12 @@ export default function TrainingView() {
   const needsDecisions = required.length > 0 && result?.status === "decisions_required"
 
   useEffect(() => {
-    async function load() {
-      if (isComplete) {
-        await loadStageResult("training")
-      } else {
-        await runStage("training")
-      }
-      setHasLoaded(true)
+    clearStageError()   // clear any stale error from a previous attempt
+    if (isComplete) {
+      loadStageResult("training").then(() => setHasLoaded(true))
+    } else {
+      setHasLoaded(true)  // show the button — don't auto-trigger the backend
     }
-    load()
   }, []) // eslint-disable-line
 
   function handleConfirm(decisionId, value) {

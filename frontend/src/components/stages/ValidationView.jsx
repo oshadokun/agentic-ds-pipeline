@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { CheckCircle, AlertTriangle, XCircle, Info, Calendar } from "lucide-react"
+import { CheckCircle, AlertTriangle, XCircle, Info, Calendar, ChevronDown, ChevronUp } from "lucide-react"
 import { usePipeline } from "../../contexts/PipelineContext"
 import AgentRunning from "../shared/AgentRunning"
 import AlertBanner from "../shared/AlertBanner"
@@ -27,7 +27,9 @@ export default function ValidationView() {
     goToNextStage, getStageStatus
   } = usePipeline()
 
-  const [hasLoaded, setHasLoaded] = useState(false)
+  const [hasLoaded, setHasLoaded]       = useState(false)
+  const [summaryOpen, setSummaryOpen]   = useState(false)
+  const [summaryTab, setSummaryTab]     = useState("columns") // "columns" | "stats"
 
   const stageStatus = getStageStatus("validation")
   const isComplete  = stageStatus === "complete"
@@ -171,6 +173,16 @@ export default function ValidationView() {
         </div>
       )}
 
+      {isComplete && result?.data_summary && (
+        <DataSummaryPanel
+          summary={result.data_summary}
+          open={summaryOpen}
+          onToggle={() => setSummaryOpen(o => !o)}
+          tab={summaryTab}
+          onTabChange={setSummaryTab}
+        />
+      )}
+
       <StageNavigation
         onContinue={goToNextStage}
         continueDisabled={!isComplete || hasStop}
@@ -188,6 +200,145 @@ function StageHeader() {
         Before we do anything else, we'll check your data for common problems —
         missing values, wrong types, and structural issues — so the model has reliable information to learn from.
       </p>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Dtype display helper
+// ---------------------------------------------------------------------------
+
+function friendlyDtype(dtype) {
+  if (!dtype) return "unknown"
+  if (dtype.startsWith("int"))      return "integer"
+  if (dtype.startsWith("float"))    return "decimal"
+  if (dtype.startsWith("datetime")) return "date"
+  if (dtype === "object")           return "text"
+  if (dtype === "bool")             return "boolean"
+  return dtype
+}
+
+// ---------------------------------------------------------------------------
+// Data Summary Panel
+// ---------------------------------------------------------------------------
+
+function DataSummaryPanel({ summary, open, onToggle, tab, onTabChange }) {
+  const { shape, columns = [], numeric_stats = [] } = summary
+
+  return (
+    <div className="border border-gray-200 rounded-2xl overflow-hidden bg-white shadow-sm">
+      {/* Toggle header */}
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center justify-between px-5 py-4
+                   hover:bg-gray-50 transition-colors text-left"
+      >
+        <div>
+          <span className="text-sm font-semibold text-gray-800">View data summary</span>
+          <span className="text-xs text-gray-400 ml-2">
+            {shape.rows.toLocaleString()} rows · {shape.columns} columns
+          </span>
+        </div>
+        {open
+          ? <ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" />
+          : <ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />
+        }
+      </button>
+
+      {open && (
+        <div className="border-t border-gray-100">
+          {/* Tabs */}
+          <div className="flex border-b border-gray-100">
+            {["columns", "stats"].map(t => (
+              <button
+                key={t}
+                onClick={() => onTabChange(t)}
+                className={`px-5 py-2.5 text-xs font-medium transition-colors ${
+                  tab === t
+                    ? "border-b-2 border-[#1B3A5C] text-[#1B3A5C]"
+                    : "text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                {t === "columns" ? "Columns" : "Numeric stats"}
+              </button>
+            ))}
+          </div>
+
+          {/* Columns tab */}
+          {tab === "columns" && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-gray-50 text-gray-500 text-left">
+                    <th className="px-4 py-2.5 font-medium">Column</th>
+                    <th className="px-4 py-2.5 font-medium">Type</th>
+                    <th className="px-4 py-2.5 font-medium text-right">Non-null</th>
+                    <th className="px-4 py-2.5 font-medium text-right">% missing</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {columns.map((col, i) => (
+                    <tr key={col.name}
+                        className={`border-t border-gray-50 ${i % 2 === 0 ? "" : "bg-gray-50/40"}`}>
+                      <td className="px-4 py-2 font-mono text-gray-800 max-w-[180px] truncate">
+                        {col.name}
+                      </td>
+                      <td className="px-4 py-2 text-gray-500">{friendlyDtype(col.dtype)}</td>
+                      <td className="px-4 py-2 text-right text-gray-600">
+                        {col.non_null_count.toLocaleString()}
+                      </td>
+                      <td className={`px-4 py-2 text-right font-medium ${
+                        col.null_pct > 0.3 ? "text-red-600"
+                        : col.null_pct > 0 ? "text-amber-600"
+                        : "text-green-600"
+                      }`}>
+                        {col.null_pct > 0 ? `${(col.null_pct * 100).toFixed(1)}%` : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Stats tab */}
+          {tab === "stats" && (
+            numeric_stats.length === 0
+              ? <p className="px-5 py-4 text-sm text-gray-400">No numeric columns found.</p>
+              : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-gray-50 text-gray-500 text-left">
+                        <th className="px-4 py-2.5 font-medium">Column</th>
+                        <th className="px-4 py-2.5 font-medium text-right">Min</th>
+                        <th className="px-4 py-2.5 font-medium text-right">Max</th>
+                        <th className="px-4 py-2.5 font-medium text-right">Mean</th>
+                        <th className="px-4 py-2.5 font-medium text-right">Median</th>
+                        <th className="px-4 py-2.5 font-medium text-right">Std dev</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {numeric_stats.map((s, i) => (
+                        <tr key={s.name}
+                            className={`border-t border-gray-50 ${i % 2 === 0 ? "" : "bg-gray-50/40"}`}>
+                          <td className="px-4 py-2 font-mono text-gray-800 max-w-[180px] truncate">
+                            {s.name}
+                          </td>
+                          {["min", "max", "mean", "median", "std"].map(k => (
+                            <td key={k} className="px-4 py-2 text-right text-gray-600 font-mono">
+                              {s[k] != null ? s[k].toLocaleString(undefined, { maximumFractionDigits: 4 }) : "—"}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+          )}
+        </div>
+      )}
     </div>
   )
 }

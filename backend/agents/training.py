@@ -232,11 +232,36 @@ def _recommend_models(task_type: str, n_rows: int,
 
     elif "time_series" in task_type or "forecast" in task_type:
         recs.append({
+            "id":       "random_forest_regressor",
+            "name":     "Random Forest",
+            "role":     "recommended",
+            "reason":   "Uses all lag and date features you created. Best accuracy for most time series datasets that have feature columns. Handles non-linear seasonal patterns automatically.",
+            "tradeoff": "Cannot extrapolate beyond the range seen in training data. Less interpretable than linear models.",
+            "interpretable": False
+        })
+        if n_rows > 1000:
+            recs.append({
+                "id":       "xgboost_regressor",
+                "name":     "XGBoost",
+                "role":     "strong_candidate",
+                "reason":   "Strong performer on tabular time series data with engineered features. Often slightly more accurate than Random Forest after tuning.",
+                "tradeoff": "Requires more tuning to get the best results. Less interpretable without SHAP.",
+                "interpretable": False
+            })
+        recs.append({
+            "id":       "ridge",
+            "name":     "Ridge Regression",
+            "role":     "strong_candidate",
+            "reason":   "Fast and interpretable. Uses all engineered features including month, day of week, and lag columns. Good linear baseline.",
+            "tradeoff": "Assumes linear relationships — may miss complex seasonal patterns.",
+            "interpretable": True
+        })
+        recs.append({
             "id":       "arima",
             "name":     "ARIMA",
-            "role":     "baseline",
-            "reason":   "Classic statistical model for time series. Learns trends and autocorrelation directly from the sequence of values.",
-            "tradeoff": "Works on the target sequence only — does not use other feature columns.",
+            "role":     "alternative",
+            "reason":   "Classic statistical model. Best when you have a raw sequence with no extra feature columns and want an interpretable model.",
+            "tradeoff": "Works on the target sequence only — does not use lag or date features. If you have feature columns, Random Forest will usually perform better.",
             "interpretable": True
         })
         try:
@@ -244,39 +269,13 @@ def _recommend_models(task_type: str, n_rows: int,
             recs.append({
                 "id":       "prophet",
                 "name":     "Prophet",
-                "role":     "strong_candidate",
-                "reason":   "Handles trend, seasonality, and holidays automatically. Robust to missing data.",
-                "tradeoff": "Works on the target sequence only. Slower to train than regression models.",
+                "role":     "alternative",
+                "reason":   "Best for data with strong seasonal patterns (daily, weekly, yearly cycles). Handles holidays and trend changes automatically.",
+                "tradeoff": "Works on the target sequence only. Slower to train. Does not use lag or date features.",
                 "interpretable": True
             })
         except ImportError:
             pass
-        recs.append({
-            "id":       "ridge",
-            "name":     "Ridge Regression",
-            "role":     "strong_candidate",
-            "reason":   "Fast and interpretable. Uses all engineered features including month, day of week, and lag columns.",
-            "tradeoff": "Assumes linear relationships — may miss complex seasonal patterns.",
-            "interpretable": True
-        })
-        if n_rows > 500:
-            recs.append({
-                "id":       "random_forest_regressor",
-                "name":     "Random Forest",
-                "role":     "strong_candidate",
-                "reason":   "Captures non-linear patterns in time-based features (month, day of week, lag columns).",
-                "tradeoff": "Cannot extrapolate beyond the range seen in training data.",
-                "interpretable": False
-            })
-        if n_rows > 1000:
-            recs.append({
-                "id":       "xgboost_regressor",
-                "name":     "XGBoost",
-                "role":     "strong_candidate",
-                "reason":   "Strong performer on tabular time series data with engineered features.",
-                "tradeoff": "Requires more tuning. Less interpretable without SHAP.",
-                "interpretable": False
-            })
 
     if interpretability_needed:
         for r in recs:
@@ -456,11 +455,17 @@ def run(session: dict, decisions: dict) -> dict:
                 actions_log.append(cw_msg)
 
         elif imbalance_strategy == "smote":
-            X_train, y_train = _apply_smote(X_train, y_train)
-            actions_log.append(
-                f"Applied SMOTE — created synthetic minority-class examples. "
-                f"Training set is now {len(y_train)} rows, balanced across classes."
-            )
+            try:
+                X_train, y_train = _apply_smote(X_train, y_train)
+                actions_log.append(
+                    f"Applied SMOTE — created synthetic minority-class examples. "
+                    f"Training set is now {len(y_train)} rows, balanced across classes."
+                )
+            except ImportError:
+                actions_log.append(
+                    "SMOTE was requested but imbalanced-learn is not installed. "
+                    "Continuing without balancing. Run: pip install imbalanced-learn"
+                )
 
         elif imbalance_strategy == "undersample":
             X_train, y_train = _apply_undersample(X_train, y_train)

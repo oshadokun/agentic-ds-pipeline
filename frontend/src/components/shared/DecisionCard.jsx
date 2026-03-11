@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { CheckCircle } from "lucide-react"
+import { CheckCircle, ChevronDown, ChevronUp } from "lucide-react"
 
 /**
  * DecisionCard
@@ -12,9 +12,10 @@ import { CheckCircle } from "lucide-react"
  *   disabled — disables interaction (e.g. already confirmed)
  */
 export default function DecisionCard({ decision, onConfirm, disabled = false }) {
-  const { id, question, recommendation, recommendation_reason, alternatives = [] } = decision
+  const { id, question, recommendation, recommendation_reason, alternatives = [], grouped_columns } = decision
   const [selected, setSelected] = useState(recommendation ?? alternatives[0]?.id ?? null)
   const [confirmed, setConfirmed] = useState(false)
+  const [colsExpanded, setColsExpanded] = useState(false)
 
   // Keep selected in sync if recommendation arrives after initial mount
   useEffect(() => {
@@ -52,9 +53,35 @@ export default function DecisionCard({ decision, onConfirm, disabled = false }) 
 
       {/* Recommendation reason */}
       {recommendation_reason && (
-        <p className="text-sm text-gray-500 mb-4 leading-relaxed">
+        <p className="text-sm text-gray-500 mb-3 leading-relaxed">
           {recommendation_reason}
         </p>
+      )}
+
+      {/* Grouped columns — collapsible list */}
+      {grouped_columns?.length > 0 && (
+        <div className="mb-4">
+          <button
+            onClick={() => setColsExpanded(e => !e)}
+            className="flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800 transition-colors"
+          >
+            {colsExpanded
+              ? <ChevronUp className="w-3.5 h-3.5" />
+              : <ChevronDown className="w-3.5 h-3.5" />
+            }
+            {colsExpanded ? "Hide" : "Show"} {grouped_columns.length} affected columns
+          </button>
+          {colsExpanded && (
+            <div className="mt-2 flex flex-wrap gap-1.5 p-3 bg-gray-50 rounded-xl border border-gray-100">
+              {grouped_columns.map(col => (
+                <span key={col} className="text-xs font-mono bg-white border border-gray-200
+                                           text-gray-700 px-2 py-0.5 rounded-md">
+                  {col}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {/* Alternatives */}

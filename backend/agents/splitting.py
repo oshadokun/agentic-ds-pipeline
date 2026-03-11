@@ -165,9 +165,15 @@ def run(session: dict, decisions: dict) -> dict:
         else:
             rec_strategy = rec["strategy"]
             rec_reason   = rec["reason"]
+        # Compute recommended percentages for the frontend slider
+        _test_pct  = round(rec.get("test_size", 0.2) * 100)
+        _val_pct   = round(rec.get("val_size",  0.1) * 100)
+        _train_pct = 100 - _test_pct - _val_pct
         return {
             "stage":  "splitting",
             "status": "decisions_required",
+            "total_rows": n_rows,
+            "recommended_ratios": {"train": _train_pct, "val": _val_pct, "test": _test_pct},
             "decisions_required": [{
                 "id":                   "split_strategy",
                 "question":             "How would you like to divide your data for training and testing?",
@@ -187,8 +193,10 @@ def run(session: dict, decisions: dict) -> dict:
 
     is_ts_goal = "time_series" in task_type or "forecast" in task_type
     strategy   = decisions.get("split_strategy", "temporal" if is_ts_goal else rec.get("strategy", "standard"))
-    test_size  = float(decisions.get("test_size",  rec.get("test_size",  0.2)))
-    val_size   = float(decisions.get("val_size",   rec.get("val_size",   0.1)))
+    # Prefer user-adjusted ratios from the slider; fall back to per-key or recommended defaults
+    _split_ratios = decisions.get("split_ratios") or {}
+    test_size = float(_split_ratios.get("test") or decisions.get("test_size") or rec.get("test_size", 0.2))
+    val_size  = float(_split_ratios.get("val")  or decisions.get("val_size")  or rec.get("val_size",  0.1))
     is_ts      = decisions.get("is_time_series", is_ts_goal)
     dt_col     = decisions.get("datetime_col")
 
@@ -290,6 +298,7 @@ def run(session: dict, decisions: dict) -> dict:
         "status":            "success",
         "strategy":          strategy,
         "split_sizes":       split_sizes,
+        "total_rows":        n_rows,
         "is_time_series":    is_ts,
         "cv_message":        cv_message,
         "output_data_path":  str(splits_dir),
