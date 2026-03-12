@@ -16,6 +16,10 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.utils import resample
 from sklearn.utils.class_weight import compute_class_weight
 
+# Task-family constants — always use set membership, never substring matching
+CLASSIFICATION_FAMILIES = {"binary_classification", "multiclass_classification"}
+TIME_SERIES_FAMILIES    = {"time_series", "time_series_forecast"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,7 +234,7 @@ def _recommend_models(task_type: str, n_rows: int,
             "interpretable": False
         })
 
-    elif "time_series" in task_type or "forecast" in task_type:
+    elif task_type in TIME_SERIES_FAMILIES:
         recs.append({
             "id":       "random_forest_regressor",
             "name":     "Random Forest",
@@ -286,7 +290,7 @@ def _recommend_models(task_type: str, n_rows: int,
 
 
 def _get_class_weights(y_train, task_type: str):
-    if "classification" not in task_type:
+    if task_type not in CLASSIFICATION_FAMILIES:
         return None, "Class weights are not applicable to regression tasks."
 
     classes = np.unique(y_train)
@@ -383,17 +387,57 @@ def _train_model(model_id: str, X_train, y_train, X_val, y_val,
 # ---------------------------------------------------------------------------
 
 def run(session: dict, decisions: dict) -> dict:
+    import traceback
+    try:
+        return _run(session, decisions)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[training] ERROR:\n{tb}")
+        return {
+            "stage":                 "training",
+            "status":                "failed",
+            "plain_english_summary": f"Training failed: {exc}",
+        }
+
+
+def _run(session: dict, decisions: dict) -> dict:
+    from contracts.schemas import RunSpec
+    from services.task_router import _METRICS_MAP
+
     session_id   = session["session_id"]
     target_col   = session["goal"].get("target_column")
     task_type    = session["goal"].get("task_type", "binary_classification")
     sessions_dir = Path("sessions")
     session_dir  = sessions_dir / session_id
     splits_dir   = session_dir / "data" / "processed" / "splits"
+    models_dir   = session_dir / "models"
 
-    # Read splits
+    # ── RunSpec is required — compiled by validation stage ────────────────
+    run_spec_path = session_dir / "artifacts" / "run_spec.json"
+    if not run_spec_path.exists():
+        return {
+            "stage":                 "training",
+            "status":                "failed",
+            "plain_english_summary": (
+                "No RunSpec found. The validation stage must complete successfully "
+                "before training can run. Please run the pipeline from the validation stage."
+            )
+        }
+    run_spec = RunSpec.load(run_spec_path)
+    task_type = run_spec.task_family  # RunSpec is the single source of truth
+
+    # ── Load preprocessed splits ──────────────────────────────────────────
+    # Prefer parquet (post-preprocessing); fall back to CSV
+    def load_split(name):
+        pq = splits_dir / f"X_{name}.parquet"
+        if pq.exists():
+            import pandas as pd
+            return pd.read_parquet(pq)
+        return pd.read_csv(splits_dir / f"X_{name}.csv")
+
     try:
-        X_train = pd.read_csv(splits_dir / "X_train.csv")
-        X_val   = pd.read_csv(splits_dir / "X_val.csv")
+        X_train = load_split("train")
+        X_val   = load_split("val")
         y_train = pd.read_csv(splits_dir / "y_train.csv").squeeze()
         y_val   = pd.read_csv(splits_dir / "y_val.csv").squeeze()
     except FileNotFoundError:
@@ -403,142 +447,105 @@ def run(session: dict, decisions: dict) -> dict:
             "plain_english_summary": "No split data found. Please run the splitting stage first."
         }
 
-    n_rows  = len(X_train)
-    n_feats = X_train.shape[1]
-    interp  = decisions.get("interpretability_needed", False)
-    # Treat as time series if either the task_type says so or the config flag was set by validation
-    if session.get("config", {}).get("is_time_series", False) and "time_series" not in task_type:
-        task_type = "time_series"
-    recs    = _recommend_models(task_type, n_rows, interp)
+    n_rows = len(X_train)
+    interp = decisions.get("interpretability_needed", False)
+    recs   = _recommend_models(task_type, n_rows, interp)
 
-    # Return model choices if not yet made
+    # ── Return model choices if not yet made ──────────────────────────────
     if not decisions or decisions.get("phase") == "request_decisions":
         return {
             "stage":  "training",
             "status": "decisions_required",
             "decisions_required": [{
-                "id":       "model_selection",
-                "question": (
+                "id":                    "model_selection",
+                "question":              (
                     "Now we are ready to train a model. Which model would you like to use? "
                     "We recommend starting with the simplest option."
                 ),
-                "recommendation":       recs[0]["id"],
+                "recommendation":        recs[0]["id"],
                 "recommendation_reason": recs[0]["reason"],
-                "alternatives": recs
+                "alternatives":          recs
             }, {
-                "id":       "interpretability_needed",
-                "question": "How important is it that you can explain exactly why the model makes each prediction?",
-                "recommendation": False,
+                "id":                    "interpretability_needed",
+                "question":              "How important is it that you can explain every prediction?",
+                "recommendation":        False,
                 "recommendation_reason": "Most use cases do not require strict explainability.",
                 "alternatives": [
-                    {"id": True,  "label": "High — I need to explain every prediction", "tradeoff": "Limits model choices to simpler models."},
-                    {"id": False, "label": "Not required — accuracy is the priority",   "tradeoff": "Opens up more powerful model options."}
+                    {"id": True,  "label": "High — I need to explain every prediction", "tradeoff": "Limits model choices."},
+                    {"id": False, "label": "Not required — accuracy is the priority",   "tradeoff": "Opens up more powerful models."}
                 ]
             }],
             "plain_english_summary": (
-                "Now we are ready to train a model. A model is a mathematical pattern learned "
-                "from your data that can predict new outcomes. Here are the options we recommend:"
+                "Now we are ready to train a model. Here are the options we recommend:"
             )
         }
 
     model_id = decisions.get("model_selection", recs[0]["id"])
 
-    # Apply imbalance strategy chosen during validation
-    imbalance_strategy = session.get("config", {}).get("imbalance_strategy") or "none"
-    actions_log        = []
-    class_weights      = None
+    # Update RunSpec with selected model if available
+    if run_spec is not None:
+        run_spec.selected_model_id = model_id
+        run_spec.save(run_spec_path)
 
-    if "classification" in task_type and imbalance_strategy != "none":
-        if imbalance_strategy == "class_weights":
-            class_weights, cw_msg = _get_class_weights(y_train, task_type)
-            if class_weights:
-                actions_log.append(cw_msg)
+    # ── Delegate to the appropriate runner ───────────────────────────────
+    # SMOTE stays in classification_runner (on X_train only, post-split)
+    is_ts_model = model_id in ("arima", "prophet")
 
-        elif imbalance_strategy == "smote":
-            try:
-                X_train, y_train = _apply_smote(X_train, y_train)
-                actions_log.append(
-                    f"Applied SMOTE — created synthetic minority-class examples. "
-                    f"Training set is now {len(y_train)} rows, balanced across classes."
-                )
-            except ImportError:
-                actions_log.append(
-                    "SMOTE was requested but imbalanced-learn is not installed. "
-                    "Continuing without balancing. Run: pip install imbalanced-learn"
-                )
-
-        elif imbalance_strategy == "undersample":
-            X_train, y_train = _apply_undersample(X_train, y_train)
-            actions_log.append(
-                f"Undersampled majority class — training set is now {len(y_train)} rows, balanced across classes."
-            )
-    elif "classification" in task_type and imbalance_strategy == "none":
-        # Check if imbalance was detected and warn
-        if session.get("config", {}).get("class_imbalance_detected"):
-            actions_log.append(
-                "No imbalance correction applied as requested. "
-                "The model may favour the majority class."
-            )
-
-    # Train
-    try:
-        model, train_s, val_s, model_path = _train_model(
-            model_id, X_train, y_train, X_val, y_val, class_weights, session_id
+    if task_type in CLASSIFICATION_FAMILIES:
+        from runners.classification_runner import run as clf_run
+        runner_result = clf_run(
+            run_spec, X_train, X_val, y_train, y_val, model_id, models_dir
         )
-    except Exception as exc:
-        return {
-            "stage":                 "training",
-            "status":                "failed",
-            "plain_english_summary": f"Training failed: {str(exc)}"
-        }
+    elif is_ts_model or task_type in TIME_SERIES_FAMILIES:
+        from runners.timeseries_runner import run as ts_run
+        runner_result = ts_run(
+            run_spec, X_train, X_val, y_train, y_val, model_id, models_dir
+        )
+    else:
+        from runners.regression_runner import run as reg_run
+        runner_result = reg_run(
+            run_spec, X_train, X_val, y_train, y_val, model_id, models_dir
+        )
+
+    train_score    = runner_result["train_score"]
+    val_score      = runner_result["val_score"]
+    model_path     = runner_result["model_path"]
+    metric_name    = runner_result["metric_name"]
+    actions_log    = runner_result.get("actions_log", [])
+    baseline_score = runner_result.get("baseline_score")
+    beats_baseline = runner_result.get("beats_baseline", True)
 
     model_display_name = next(
         (r["name"] for r in recs if r["id"] == model_id),
         model_id.replace("_", " ").title()
     )
 
-    is_ts_model = model_id in ("arima", "prophet")
+    is_ts_display  = is_ts_model or task_type in TIME_SERIES_FAMILIES
+    metric_value   = round(val_score, 4)
 
-    if is_ts_model:
-        # For ARIMA/Prophet use MAE and RMSE on both train and val — never mix R² and MAE
-        y_pred_train = model.predict(X_train)
-        y_pred_val   = model.predict(X_val)
-        mae_train    = float(mean_absolute_error(y_train, y_pred_train))
-        mae_val      = float(mean_absolute_error(y_val,   y_pred_val))
-        rmse_val     = float(np.sqrt(mean_squared_error(y_val, y_pred_val)))
-        metric_name       = "MAE"
-        metric_value      = round(mae_val, 4)
-        train_score_display = round(mae_train, 4)
-        val_score_display   = round(mae_val, 4)
-        overfitting_detected = False
-        summary = (
-            f"We trained a {model_display_name} model on your data. "
-            f"On average, its predictions are off by {_fmt_number(mae_val)} "
-            f"(RMSE: {_fmt_number(rmse_val)}). "
-            f"We'll try to improve this in the tuning step."
-        )
-    else:
-        overfit = _detect_overfitting(train_s, val_s)
-        actions_log.append(overfit["plain_english"])
-        metric_name         = "Accuracy" if "classification" in task_type else "R²"
-        metric_value        = round(val_s, 4)
-        train_score_display = round(train_s, 4)
-        val_score_display   = round(val_s, 4)
+    # Overfitting detection (classification / regression only)
+    overfitting_detected = False
+    if not is_ts_display:
+        overfit = _detect_overfitting(train_score, val_score)
         overfitting_detected = overfit["overfitting_detected"]
-        summary = (
-            f"We trained a {model_display_name} model on your data. "
-            + overfit["plain_english"]
-        )
+        actions_log.append(overfit["plain_english"])
+
+    summary = (
+        f"We trained a {model_display_name} model. "
+        + (f"Validation {metric_name}: {metric_value}. " if not is_ts_display else f"Validation MAE: {metric_value}. ")
+        + (f"Baseline: {baseline_score}. " if baseline_score is not None else "")
+        + ("Did not beat baseline — review features." if not beats_baseline else "")
+    )
 
     # Save best model reference
     best_model_info = {
         "model_id":    model_id,
         "model_path":  model_path,
-        "val_score":   val_score_display,
+        "val_score":   val_score,
         "metric_name": metric_name,
     }
-    models_dir = session_dir / "models"
-    with open(models_dir / "best_model.json", "w") as f:
+    models_dir_path = session_dir / "models"
+    with open(models_dir_path / "best_model.json", "w") as f:
         json.dump(best_model_info, f)
 
     return {
@@ -549,10 +556,12 @@ def run(session: dict, decisions: dict) -> dict:
         "metric_name":            metric_name,
         "metric_value":           metric_value,
         "model_path":             model_path,
-        "train_score":            train_score_display,
-        "val_score":              val_score_display,
+        "train_score":            round(train_score, 4),
+        "val_score":              round(val_score, 4),
+        "baseline_score":         round(baseline_score, 4) if baseline_score is not None else None,
+        "beats_baseline":         beats_baseline,
         "overfitting_detected":   overfitting_detected,
-        "class_weights_applied":  class_weights is not None,
+        "class_weights_applied":  runner_result.get("class_weights_applied", False),
         "decisions_required":     [],
         "decisions_made":         [{"decision": "model_selection", "chosen": model_id}],
         "plain_english_summary":  summary,
@@ -560,18 +569,19 @@ def run(session: dict, decisions: dict) -> dict:
             "stage":   "training",
             "title":   "Training Your Model",
             "summary": summary,
-            "decision_made": f"Trained {model_id.replace('_', ' ').title()} model.",
+            "decision_made": f"Trained {model_display_name}.",
             "alternatives_considered": "; ".join([r["name"] for r in recs if r["id"] != model_id]),
             "why_this_matters": (
-                "Training is where the model learns the patterns in your data. The choices made here "
-                "directly affect how well it performs on new data."
+                "Training is where the model learns the patterns in your data. "
+                "We run a baseline first so you know whether the model has learned anything useful."
             )
         },
         "config_updates": {
             "model_id":           model_id,
             "model_path":         model_path,
-            "class_weights":      class_weights,
-            "imbalance_strategy": imbalance_strategy,
+            "imbalance_strategy": session.get("config", {}).get("imbalance_strategy", "none"),
             "framework":          "sklearn" if "xgboost" not in model_id else "xgboost"
         }
     }
+
+

@@ -9,6 +9,10 @@ import pickle
 import traceback
 from pathlib import Path
 
+# Task-family constants — always use set membership, never substring matching
+CLASSIFICATION_FAMILIES = {"binary_classification", "multiclass_classification"}
+TIME_SERIES_FAMILIES    = {"time_series", "time_series_forecast"}
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -34,9 +38,14 @@ def _evaluate_classifier(model, X, y, task_type: str) -> dict:
     except Exception:
         pass
 
-    # Round to integers — SMOTE can produce continuous float target values
-    y      = np.array(y).round().astype(int)
-    y_pred = np.array(model.predict(X)).round().astype(int)
+    # BUG FIX: y.round().astype(int) was removed.
+    # Labels from the split are always integer/string — they should never be
+    # continuous floats. SMOTE is applied only to X_train in classification_runner
+    # and does not affect val/test labels. If a continuous float label reaches
+    # here it is a data pipeline error and should fail loudly, not be silently
+    # rounded. The evaluation_service._assert_integer_labels() guard handles this.
+    y      = np.array(y)
+    y_pred = np.array(model.predict(X))
 
     y_proba = None
     if hasattr(model, "predict_proba"):
@@ -349,6 +358,9 @@ def run(session: dict, decisions: dict) -> dict:
 
 
 def _run(session: dict, decisions: dict) -> dict:
+    from contracts.schemas import RunSpec
+    from services.evaluation_service import evaluate as svc_evaluate
+
     session_id        = session["session_id"]
     target_col        = session["goal"].get("target_column")
     task_type         = session["goal"].get("task_type", "binary_classification")
@@ -357,6 +369,20 @@ def _run(session: dict, decisions: dict) -> dict:
     is_final          = decisions.get("is_final_evaluation", False)
     sessions_dir      = Path("sessions")
     session_dir       = sessions_dir / session_id
+
+    # ── RunSpec is required ───────────────────────────────────────────────
+    run_spec_path = session_dir / "artifacts" / "run_spec.json"
+    if not run_spec_path.exists():
+        return {
+            "stage":                 "evaluation",
+            "status":                "failed",
+            "plain_english_summary": (
+                "No RunSpec found. Validation must complete before evaluation can run. "
+                "Please run the pipeline from the validation stage."
+            )
+        }
+    run_spec = RunSpec.load(run_spec_path)
+    task_type = run_spec.task_family  # RunSpec is the single source of truth
 
     output_dir = session_dir / "reports" / "evaluation"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -387,8 +413,13 @@ def _run(session: dict, decisions: dict) -> dict:
     split_name = "test" if is_final else "validation"
     suffix     = "test" if is_final else "val"
 
+    # Load preprocessed features (prefer parquet, fall back to CSV)
     try:
-        X_eval = pd.read_csv(splits_dir / f"X_{suffix}.csv")
+        pq_path = splits_dir / f"X_{suffix}.parquet"
+        if pq_path.exists():
+            X_eval = pd.read_parquet(pq_path)
+        else:
+            X_eval = pd.read_csv(splits_dir / f"X_{suffix}.csv")
         y_eval = pd.read_csv(splits_dir / f"y_{suffix}.csv").squeeze()
     except FileNotFoundError:
         return {
@@ -397,84 +428,67 @@ def _run(session: dict, decisions: dict) -> dict:
             "plain_english_summary": f"No {split_name} split found. Please run the splitting stage first."
         }
 
-    # Get class names for classification
-    class_names = None
-    if "classification" in task_type:
+    # ── Evaluate via evaluation_service (single source of truth) ─────────
+    payload = svc_evaluate(
+        model, X_eval, y_eval, run_spec, suffix,
+        eval_dir=output_dir, class_imbalance=class_imbalance
+    )
+    metrics              = payload.metrics
+    verdict              = payload.verdict
+    verdict_msg          = payload.verdict_message
+    primary_metric       = payload.primary_metric
+    primary_metric_value = float(payload.primary_metric_value)
+    class_names          = payload.label_order
+
+    # Supplement class_names for classification if payload didn't provide them
+    if task_type in CLASSIFICATION_FAMILIES and class_names is None:
         class_names = sorted([str(c) for c in y_eval.unique()])
 
-    # Compute metrics
     time_series_data = None
     high_r2_warning  = False
     high_auc_warning = False
     is_time_series_model = (
-        is_ts or
-        model.__class__.__name__ in ("ARIMAWrapper", "ProphetWrapper") or
-        "time_series" in task_type or
-        "forecast" in task_type
+        task_type in TIME_SERIES_FAMILIES or
+        model.__class__.__name__ in ("ARIMAWrapper", "ProphetWrapper")
     )
     y_range = None
 
-    if "classification" in task_type:
-        metrics = _evaluate_classifier(model, X_eval, y_eval, task_type)
-        # Warn on suspiciously high AUC-ROC for imbalanced datasets
-        if class_imbalance and metrics.get("roc_auc", 0) > 0.99:
-            high_auc_warning = True
-        charts = []
-        if task_type == "binary_classification":
-            charts.append(_plot_roc(model, X_eval, y_eval, str(output_dir)))
+    if class_imbalance and metrics.get("roc_auc", 0) > 0.99:
+        high_auc_warning = True
+    if metrics.get("r2", 0) > 0.98:
+        high_r2_warning = bool(True)
 
+    # Charts
+    charts = []
+    if task_type == "binary_classification":
+        charts.append(_plot_roc(model, X_eval, y_eval, str(output_dir)))
     elif is_time_series_model:
-        metrics = _evaluate_time_series_model(model, X_eval, y_eval)
-        y_pred  = model.predict(X_eval)
+        y_pred = model.predict(X_eval.astype(np.float64))
         y_true_list = y_eval.tolist()
         y_pred_list = [float(v) for v in y_pred]
         y_range = float(y_eval.max() - y_eval.min()) if len(y_eval) > 0 else None
         charts  = [_plot_time_series_predictions(y_true_list, y_pred_list, str(output_dir))]
-        # Data for interactive frontend chart (sample to ≤200 points for performance)
         step = max(1, len(y_true_list) // 200)
         time_series_data = [
             {"index": i, "actual": round(y_true_list[i], 4), "predicted": round(y_pred_list[i], 4)}
             for i in range(0, len(y_true_list), step)
         ]
-
     else:
-        metrics = _evaluate_regressor(model, X_eval, y_eval)
-        if metrics.get("r2", 0) > 0.98:
-            high_r2_warning = bool(True)
-        y_pred  = model.predict(X_eval)
+        y_pred = model.predict(X_eval.astype(np.float64))
         y_true_list = y_eval.tolist()
         y_pred_list = [float(v) for v in y_pred]
-        charts  = [_plot_residuals(y_true_list, y_pred_list, str(output_dir))]
+        charts = [_plot_residuals(y_true_list, y_pred_list, str(output_dir))]
 
     interpretations = _interpret_metrics(
         metrics, task_type, target_col, class_names,
         y_range=y_range, is_ts=is_time_series_model
     )
 
-    if is_time_series_model:
-        verdict, verdict_msg = _performance_verdict_ts(metrics, y_range)
-    else:
-        verdict, verdict_msg = _performance_verdict(metrics, task_type, class_imbalance)
-
     cm_text = _interpret_confusion_matrix(
         metrics.get("confusion_matrix", []), class_names
-    ) if is_final and "classification" in task_type else None
+    ) if is_final and task_type in CLASSIFICATION_FAMILIES else None
 
     summary = " ".join(interpretations[:2]) + f" Our assessment: {verdict_msg}"
-
-    # Primary metric value for config
-    if is_time_series_model:
-        primary_metric       = "mae"
-        primary_metric_value = metrics.get("mae", 0)
-    elif task_type == "binary_classification":
-        primary_metric       = "pr_auc" if class_imbalance else "roc_auc"
-        primary_metric_value = metrics.get(primary_metric, metrics.get("accuracy", 0))
-    elif task_type == "regression":
-        primary_metric       = "r2"
-        primary_metric_value = metrics.get("r2", 0)
-    else:
-        primary_metric       = "f1"
-        primary_metric_value = metrics.get("f1", 0)
 
     return {
         "stage":                     "evaluation",

@@ -484,6 +484,53 @@ def run(session: dict, decisions: dict) -> dict:
         for r in hard_stops + warnings + advisories
     )
 
+    # ── Compile and save initial RunSpec (best-effort; non-fatal) ─────────
+    # This establishes the task family, primary metric, and split strategy
+    # that all downstream stages will use.  Later stages update the RunSpec
+    # with their tactical decisions (scaling, imputation, features, etc.).
+    run_spec_compiled = False
+    if overall != "hard_stop":
+        try:
+            import json as _json
+            from services.manifest_builder import build as _build_manifest
+            from services.task_router import resolve as _route_task
+            from services.pipeline_compiler import compile_run_spec as _compile_run_spec
+
+            artifacts_dir = sessions_dir / session_id / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            _manifest = _build_manifest(df, target_column=target_col)
+            _time_col = time_series_cols[0] if time_series_cols else None
+            _routing  = _route_task(task_type, _manifest, target_col, _time_col)
+
+            # Only decisions available at validation time
+            _initial_decisions = {
+                "target_column":   target_col,
+                "balance_classes": decisions.get("imbalance_strategy", "none"),
+            }
+            _run_spec = _compile_run_spec(session_id, _manifest, _routing, _initial_decisions)
+            _run_spec.save(artifacts_dir / "run_spec.json")
+
+            # Save manifest for downstream reference
+            _manifest_dict = {
+                "dataset_id":               _manifest.dataset_id,
+                "row_count":                _manifest.row_count,
+                "column_count":             _manifest.column_count,
+                "numeric_columns":          _manifest.numeric_columns,
+                "categorical_columns":      _manifest.categorical_columns,
+                "datetime_columns":         _manifest.datetime_columns,
+                "binary_columns":           _manifest.binary_columns,
+                "text_columns":             _manifest.text_columns,
+                "candidate_target_columns": _manifest.candidate_target_columns,
+                "candidate_time_columns":   _manifest.candidate_time_columns,
+            }
+            (artifacts_dir / "manifest.json").write_text(
+                _json.dumps(_manifest_dict, indent=2)
+            )
+            run_spec_compiled = True
+        except Exception as _e:
+            print(f"[validation] RunSpec compilation failed (non-fatal): {_e}")
+
     return {
         "stage":                "validation",
         "status":               overall,
@@ -508,6 +555,7 @@ def run(session: dict, decisions: dict) -> dict:
                 "information rather than noise."
             )
         },
+        "run_spec_compiled": run_spec_compiled,
         "config_updates": {
             "validation_passed":        overall != "hard_stop",
             "class_imbalance_detected": class_imbalance,

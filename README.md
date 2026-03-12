@@ -20,12 +20,68 @@ Feature Engineering → Scaling → Splitting → Training →
 Evaluation → Tuning → Explainability (SHAP) → Deployment → Monitoring
 ```
 
+### Architecture — Compiler-Driven Orchestration (v2)
+
+The backend was refactored in March 2026 to a compiler-driven architecture
+that eliminates data leakage and makes every stage derive its decisions from
+a single, validated source of truth.
+
+**How it works**
+
+1. **Validation** builds a `DatasetManifest`, routes the task family through
+   `task_router`, compiles a `RunSpec`, and saves it to
+   `sessions/{id}/artifacts/run_spec.json`. This is the first and only time
+   the manifest is built and the task family is resolved.
+
+2. **Cleaning / Feature Engineering / Normalisation** record their decisions
+   (imputation strategies, scaling choice, feature columns) into the session
+   config. They do not fit any transformers.
+
+3. **Splitting** loads the saved `RunSpec`, merges all accumulated decisions
+   into its preprocessing plan, then executes in strict order:
+   - `split_service.split()` — pure index manipulation
+   - `preprocessing_service.fit_transform()` — fits on `X_train` only,
+     transforms all three splits, saves `preprocessor.pkl`
+
+4. **Training / Evaluation** load the `RunSpec` and use it as the single
+   source of truth for task family, metrics, and model selection. Both agents
+   hard-fail with a clear message if `run_spec.json` is absent.
+
+**New services and runners**
+
+| Module | Responsibility |
+|---|---|
+| `contracts/schemas.py` | `DatasetManifest`, `RunSpec`, `EvaluationPayload` dataclasses |
+| `services/manifest_builder.py` | Inspects raw DataFrame; builds `DatasetManifest` |
+| `services/task_router.py` | Validates declared task against data; locks primary metric |
+| `services/pipeline_compiler.py` | Builds `RunSpec` + unfitted sklearn `Pipeline` |
+| `services/split_service.py` | Pure index split; returns `SplitResult` |
+| `services/preprocessing_service.py` | Fits on `X_train` only; saves parquet splits + `preprocessor.pkl` |
+| `services/evaluation_service.py` | Single-pass frozen `EvaluationPayload`; no `y.round()` |
+| `services/artifact_service.py` | Packages model + preprocessor for deployment inference |
+| `runners/classification_runner.py` | Baseline → SMOTE/weights → fit → baseline check |
+| `runners/regression_runner.py` | Baseline → fit → baseline check |
+| `runners/timeseries_runner.py` | Naive persistence baseline → fit → baseline check |
+
 ### What works
 
 **Pipeline flow**
 - All 14 stages complete without errors on classification and regression datasets
 - Session state persists across browser refreshes; stages can be re-run
 - Report download generated client-side after monitoring
+
+**Data integrity**
+- Scaler, imputer, and IQR capper all fitted on `X_train` only (no test-set leakage)
+- Custom `_IQRCapper` transformer inside the sklearn Pipeline enforces this
+- `EvaluationPayload` is frozen — all metrics from one pass, no re-computation
+- Classification labels never silently rounded; continuous floats are a hard error
+- SMOTE applied to `X_train` only, after preprocessing, inside `classification_runner`
+
+**Task routing**
+- Task family validated against data at validation time; `TaskRoutingError` raised
+  on mismatches (e.g. regression declared on a categorical target)
+- All task-family checks use strict set membership (`task_family in {"binary_classification", ...}`);
+  no substring matching anywhere in the codebase
 
 **EDA**
 - When 3+ columns share the same issue, they are grouped into a single decision card
@@ -38,7 +94,8 @@ Evaluation → Tuning → Explainability (SHAP) → Deployment → Monitoring
 - "What we did" summary groups repeated actions into a single collapsed line
   (e.g. "Capped extreme values in 25 columns (V1, V2, V3… and 22 more)")
   with a "show all / show less" toggle
-- SMOTE applied for imbalanced classification when minority class < 30%
+- Structural cleaning only (dtype fixes, duplicate removal, text normalisation);
+  no imputation or outlier fitting before the split
 
 **Scaling (Normalisation)**
 - Two-phase model-aware flow: first asks which model the user plans to use,
@@ -48,12 +105,15 @@ Evaluation → Tuning → Explainability (SHAP) → Deployment → Monitoring
   - Neural Network → Min-Max scaling
   - ARIMA / Prophet → No scaling
   - Not decided yet → Standard scaling (safe fallback)
+- Decision recorded only; scaler fitted post-split in `preprocessing_service`
 
 **Splitting**
 - User-adjustable train / validation / test sliders; always sum to 100%
 - Row counts shown in real time based on dataset size
 - Recommended ratios pre-filled from backend (based on dataset size)
 - Confirmed ratios correctly passed to the backend split call
+- Hard-fails if `run_spec.json` not found (validation must run first)
+- Cross-validation path disabled until per-fold preprocessing is implemented
 
 **Evaluation**
 - Classification metrics: Accuracy, Precision, Recall, F1, AUC-ROC, AUC-PR,
@@ -64,7 +124,6 @@ Evaluation → Tuning → Explainability (SHAP) → Deployment → Monitoring
   TN = "Correctly cleared", FP = "False alarm", FN = "Missed", TP = "Correctly identified"
 - Amber warning card when R² > 0.98 (possible data leakage)
 - Amber warning card when AUC-ROC > 0.99 on imbalanced data
-- SMOTE float target values rounded to int before metrics (prevents sklearn crash)
 
 **Explainability**
 - Full SHAP waterfall and bar charts for all supported model types
@@ -80,6 +139,7 @@ Evaluation → Tuning → Explainability (SHAP) → Deployment → Monitoring
 | ROC curve occasionally unavailable (model wrapper mismatch) | In progress |
 | Lag feature screen appears for non-time-series datasets | Needs `is_time_series` guard in FeatureEngineeringView |
 | Cleaning stage grouped outlier card not always rendering (individual cards may show) | In progress |
+| Cross-validation not yet supported with new preprocessing pipeline | Disabled — hard-fails with message |
 
 ---
 
@@ -203,16 +263,30 @@ ds-pipeline/
 ├── backend/                           ← You build this
 │   ├── main.py
 │   ├── requirements.txt
+│   ├── contracts/                     ← Core data contracts (v2)
+│   │   └── schemas.py                 ← DatasetManifest, RunSpec, EvaluationPayload
+│   ├── services/                      ← Stateless, reusable services (v2)
+│   │   ├── manifest_builder.py
+│   │   ├── task_router.py
+│   │   ├── pipeline_compiler.py
+│   │   ├── split_service.py
+│   │   ├── preprocessing_service.py
+│   │   ├── evaluation_service.py
+│   │   └── artifact_service.py
+│   ├── runners/                       ← Task-family branch runners (v2)
+│   │   ├── classification_runner.py
+│   │   ├── regression_runner.py
+│   │   └── timeseries_runner.py
 │   └── agents/
 │       ├── ingestion.py
-│       ├── validation.py
+│       ├── validation.py              ← Compiles RunSpec (v2)
 │       ├── eda.py
-│       ├── cleaning.py
+│       ├── cleaning.py                ← Structural only, no fitting (v2)
 │       ├── feature_engineering.py
-│       ├── normalisation.py
-│       ├── splitting.py
-│       ├── training.py
-│       ├── evaluation.py
+│       ├── normalisation.py           ← Decision recording only, no fitting (v2)
+│       ├── splitting.py               ← Consumes RunSpec, orchestrates fit (v2)
+│       ├── training.py                ← Delegates to runners (v2)
+│       ├── evaluation.py              ← Uses evaluation_service exclusively (v2)
 │       ├── tuning.py
 │       ├── explainability.py
 │       ├── deployment.py
@@ -602,10 +676,30 @@ must be completed before any pipeline stage runs. This is enforced in
 `main.py` — the stage run endpoint checks `session.privacy.user_acknowledged`
 before executing.
 
-**Scaler fitted on training data only**
-The scaler is always fitted on `X_train` only and then applied to `X_val`
-and `X_test`. It is never fitted on the full dataset. This is enforced in
-the normalisation agent.
+**Preprocessing fitted on training data only**
+All learned transformers (imputer, IQR capper, scaler, encoder) are fitted
+on `X_train` only inside `preprocessing_service.fit_transform()`, called by
+the splitting agent after the split. No agent before splitting fits any
+transformer. `scaled.csv` is a pass-through copy of `features.csv` and is
+not treated as authoritative preprocessed input.
+
+**RunSpec is the single source of truth**
+`run_spec.json` is compiled by the validation agent and lives at
+`sessions/{id}/artifacts/run_spec.json`. Every downstream agent loads it
+to determine task family, primary metric, preprocessing plan, and model
+selection. No agent re-infers these values from session goal text. Training,
+evaluation, and splitting all hard-fail if `run_spec.json` is absent.
+
+**Task family by strict equality only**
+Task family checks always use set membership:
+`task_family in {"binary_classification", "multiclass_classification"}`.
+Substring matching (`"classification" in task_type`) is prohibited across
+the entire codebase.
+
+**EvaluationPayload is frozen**
+All metrics are computed exactly once in `evaluation_service.evaluate()` and
+stored in a frozen `EvaluationPayload`. No widget, stage, or chart may
+recompute metrics independently from that payload.
 
 ---
 

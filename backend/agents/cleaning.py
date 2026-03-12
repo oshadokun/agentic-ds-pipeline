@@ -373,32 +373,40 @@ def run(session: dict, decisions: dict) -> dict:
             }
         # No decisions needed — fall through to apply automatic fixes
 
-    # Apply cleaning based on user decisions
+    # ---------------------------------------------------------------------------
+    # STRUCTURAL CLEANING ONLY
+    # Leakage rule: imputation, outlier capping, and SMOTE all depend on
+    # distribution statistics that must be learned from training data only.
+    # Those operations are recorded as decisions here and applied post-split
+    # by preprocessing_service via the compiled sklearn Pipeline.
+    # ---------------------------------------------------------------------------
+
     rows_before = len(df)
     cols_before = len(df.columns)
     actions_log = []
 
-    # 1. Duplicates
+    # 1. Duplicates — structural, safe to apply now
     dup_decision = decisions.get("handle_duplicates", "remove")
     if dup_decision == "remove":
         df, dup_result = _remove_duplicates(df)
         actions_log.append(dup_result["plain_english"])
 
-    # 2. Data type fixes (automatic)
+    # 2. Data type fixes — deterministic, safe to apply now
     df, dtype_actions = _fix_dtypes(df)
     actions_log.extend(dtype_actions)
 
-    # 3. Text standardisation (automatic)
+    # 3. Text standardisation — deterministic, safe to apply now
     df, text_actions = _standardise_categoricals(df)
     actions_log.extend(text_actions)
 
-    # 4. Missing values — user decisions
+    # 4. Record imputation decisions (NOT applied here — applied post-split
+    #    by preprocessing_service so imputers fit on training data only).
     missing_decisions = {
         k.replace("missing_", ""): v
         for k, v in decisions.items()
         if k.startswith("missing_")
     }
-    # Also handle columns with < 5% missing automatically
+    # Auto-record strategy for columns with < 5% missing (no user prompt needed)
     for col in df.columns:
         if col == target_col:
             continue
@@ -407,23 +415,23 @@ def run(session: dict, decisions: dict) -> dict:
             rec, _ = _recommend_impute(col, df, pct)
             missing_decisions[col] = rec
 
-    for col, strategy in missing_decisions.items():
-        if col in df.columns:
-            df, msg = _apply_imputation(df, col, strategy)
-            actions_log.append(msg)
+    if missing_decisions:
+        actions_log.append(
+            f"Recorded imputation strategies for {len(missing_decisions)} column(s). "
+            "These will be fitted on training data only after the split."
+        )
 
-    # 5. Outliers — start from EDA decisions, overlay any cleaning-stage decisions
+    # 5. Record outlier strategies (NOT applied here — IQR boundaries will be
+    #    computed from training data only inside the compiled Pipeline).
     outlier_decisions = dict(eda_findings.get("outlier_strategy", {}))
-    # Expand grouped EDA decision: outliers__grouped → per-column strategy
     if "outliers__grouped" in decisions:
         grouped_strategy = decisions["outliers__grouped"]
         for col in eda_findings.get("high_outlier_cols", []):
             outlier_decisions.setdefault(col, grouped_strategy)
-    # Overlay per-column decisions confirmed during cleaning
     for k, v in decisions.items():
         if k.startswith("outlier_"):
             outlier_decisions[k.replace("outlier_", "", 1)] = v
-    # Auto-cap minor outliers (< 1%)
+    # Auto-record "cap" for minor outlier columns with no explicit decision
     for col in df.select_dtypes("number").columns:
         if col == target_col or col in outlier_decisions:
             continue
@@ -431,36 +439,34 @@ def run(session: dict, decisions: dict) -> dict:
             continue
         Q1, Q3  = df[col].quantile([0.25, 0.75])
         IQR     = Q3 - Q1
-        out_pct = float(((df[col] < Q1 - 1.5 * IQR) | (df[col] > Q3 + 1.5 * IQR)).mean())
-        if 0 < out_pct <= 0.01:
-            df, msg = _handle_outliers(df, col, "cap")
-            actions_log.append(msg)
+        if IQR > 0:
+            out_pct = float(((df[col] < Q1 - 1.5 * IQR) | (df[col] > Q3 + 1.5 * IQR)).mean())
+            if 0 < out_pct <= 0.01:
+                outlier_decisions[col] = "cap"
 
-    for col, strategy in outlier_decisions.items():
-        if col in df.columns:
-            df, msg = _handle_outliers(df, col, strategy)
-            actions_log.append(msg)
+    if outlier_decisions:
+        actions_log.append(
+            f"Recorded outlier strategies for {len(outlier_decisions)} column(s). "
+            "Boundaries will be computed from training data only after the split."
+        )
 
-    # 6. Class imbalance — record user decision; SMOTE is applied in training.py
-    #    after the data is split, so it only affects the training split.
+    # 6. Record class imbalance decision — SMOTE applied in classification_runner
+    #    on X_train only, after the split and after preprocessing.
     balance_choice        = decisions.get("balance_classes", "none")
     class_imbalance_found = False
-    imbalance_note        = ""
     if "classification" in task_type and target_col and target_col in df.columns:
         vc           = df[target_col].value_counts(normalize=True)
         minority_pct = float(vc.min())
         majority_pct = float(vc.max())
         if minority_pct < 0.30:
             class_imbalance_found = True
-            if balance_choice == "smote":
-                imbalance_note = (
-                    f"Your data had imbalanced classes ({minority_pct:.0%} vs {majority_pct:.0%}). "
-                    f"We will create synthetic examples of the minority class to help the model "
-                    f"learn both outcomes equally."
+            if balance_choice in ("smote", "undersample", "class_weights"):
+                actions_log.append(
+                    f"Imbalanced classes detected ({minority_pct:.0%} vs {majority_pct:.0%}). "
+                    f"Strategy '{balance_choice}' will be applied to training data only after the split."
                 )
-                actions_log.append(imbalance_note)
 
-    # Save cleaned data
+    # Save structurally cleaned data (no imputation, no outlier capping)
     output_path = session_dir / "data" / "interim" / "cleaned.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
@@ -469,9 +475,11 @@ def run(session: dict, decisions: dict) -> dict:
     cols_after = len(df.columns)
 
     summary = (
-        f"We cleaned your data. "
-        + (f"We removed {rows_before - rows_after} rows and {cols_before - cols_after} columns. " if rows_before != rows_after or cols_before != cols_after else "")
-        + f"Your dataset now has {rows_after:,} rows and {cols_after} columns ready for the next stage."
+        "We cleaned your data (duplicates, type fixes, text standardisation). "
+        + (f"Removed {rows_before - rows_after} duplicate rows. " if rows_before != rows_after else "")
+        + f"Your dataset now has {rows_after:,} rows and {cols_after} columns. "
+        + "Imputation and outlier capping will be applied after the data is split, "
+        + "to prevent information from the test set leaking into the model."
     )
 
     return {
@@ -491,16 +499,17 @@ def run(session: dict, decisions: dict) -> dict:
             "title":   "Cleaning Your Data",
             "summary": summary,
             "decision_made": "; ".join(actions_log[:5]) + ("..." if len(actions_log) > 5 else ""),
-            "alternatives_considered": "Multiple strategies were available for handling missing values and outliers.",
+            "alternatives_considered": "Multiple strategies were available for missing values and outliers.",
             "why_this_matters": (
-                "Clean data means the model learns from reliable information rather than gaps and errors."
+                "Structural cleaning removes clear data errors. Imputation and outlier handling "
+                "are deferred to after the split so the model cannot learn from test-set distributions."
             )
         },
         "config_updates": {
-            "impute_strategies":       missing_decisions,
-            "outlier_strategies":      outlier_decisions,
-            "rows_removed":            rows_before - rows_after,
+            "impute_strategies":        missing_decisions,
+            "outlier_strategies":       outlier_decisions,
+            "rows_removed":             rows_before - rows_after,
             "class_imbalance_detected": class_imbalance_found,
-            "imbalance_strategy":      balance_choice if class_imbalance_found else "none"
+            "imbalance_strategy":       balance_choice if class_imbalance_found else "none"
         }
     }

@@ -5,7 +5,6 @@ Scales numeric features. Fits the scaler on the FULL features dataset
 The fitted scaler is saved for deployment use.
 """
 
-import pickle
 from pathlib import Path
 
 import matplotlib
@@ -274,67 +273,39 @@ def run(session: dict, decisions: dict) -> dict:
 
     strategy = decisions.get("scaling_strategy") or "standard"
 
-    if not numeric_cols or strategy == "none":
-        # No scaling — just copy features.csv to scaled.csv
-        output_path = session_dir / "data" / "processed" / "scaled.csv"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(output_path, index=False)
-        return {
-            "stage":            "normalisation",
-            "status":           "success",
-            "scaling_strategy": "none",
-            "columns_scaled":   [],
-            "columns_skipped":  numeric_cols,
-            "scaler_path":      None,
-            "chart_path":       None,
-            "output_data_path": str(output_path),
-            "decisions_required": [],
-            "decisions_made":   [{"decision": "scaling_strategy", "chosen": "none"}],
-            "plain_english_summary": "No scaling applied — the model you are using does not require it.",
-            "report_section": {
-                "stage":   "normalisation",
-                "title":   "Scaling Your Data",
-                "summary": "No scaling applied.",
-                "decision_made": "Scaling skipped — tree-based models do not require it.",
-                "alternatives_considered": "Standard, Min-Max, and Robust scaling were available.",
-                "why_this_matters": "Tree-based models handle different value scales natively."
-            },
-            "config_updates": {
-                "scaling_strategy": "none",
-                "scaled_columns":   [],
-                "scaler_path":      None,
-                "model_preference": model_preference
-            }
-        }
+    # -------------------------------------------------------------------------
+    # DECISION COLLECTION ONLY — no scaler.fit() here.
+    #
+    # Leakage rule: fitting a scaler on the full dataset (before the split)
+    # means the scaler learns the mean/std of validation and test rows.
+    # The scaler is now built and fitted by preprocessing_service inside
+    # splitting.py, on X_train ONLY, after the split.
+    #
+    # This stage records the scaling_strategy decision into session config.
+    # The actual fitted scaler is saved at:
+    #   sessions/{id}/models/preprocessor.pkl
+    # after the splitting stage completes.
+    # -------------------------------------------------------------------------
 
-    scaler = _make_scaler(strategy)
-    df_before = df.copy()
-
-    scaler.fit(df[numeric_cols])
-    df_after        = df.copy()
-    df_after[numeric_cols] = scaler.transform(df[numeric_cols])
-
-    # Save scaler
-    models_dir  = session_dir / "models"
-    models_dir.mkdir(parents=True, exist_ok=True)
-    scaler_path = models_dir / "scaler.pkl"
-    with open(scaler_path, "wb") as f:
-        pickle.dump(scaler, f)
-
-    # Save scaled full dataset
+    # Copy features.csv to scaled.csv so downstream stages that load
+    # scaled.csv (e.g. old splitting.py path) still find a file.
     output_path = session_dir / "data" / "processed" / "scaled.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df_after.to_csv(output_path, index=False)
+    df.to_csv(output_path, index=False)
 
-    # Comparison chart
-    reports_dir = str(session_dir / "reports")
-    chart_path  = _plot_comparison(df_before, df_after, numeric_cols, reports_dir)
+    strategy_label = SCALING_STRATEGIES.get(strategy, {}).get("label", strategy)
 
-    msg = (
-        f"Scaled {len(numeric_cols)} numeric column(s) using {SCALING_STRATEGIES[strategy]['label']}. "
-        f"The shape of your data has not changed — only the numbers on the axis. "
-        f"The scaler has been saved for use when the model is deployed."
-    )
+    if strategy == "none":
+        msg = (
+            "No scaling required for your chosen model. "
+            "This decision has been recorded and will be applied when the data is split."
+        )
+    else:
+        msg = (
+            f"Scaling strategy recorded: {strategy_label}. "
+            f"The scaler will be fitted on training data only during the splitting stage, "
+            f"to prevent test-set information from influencing the transformation."
+        )
 
     return {
         "stage":             "normalisation",
@@ -342,8 +313,8 @@ def run(session: dict, decisions: dict) -> dict:
         "scaling_strategy":  strategy,
         "columns_scaled":    numeric_cols,
         "columns_skipped":   skip_cols,
-        "scaler_path":       str(scaler_path),
-        "chart_path":        chart_path,
+        "scaler_path":       None,   # scaler fitted post-split; see preprocessor.pkl
+        "chart_path":        None,   # chart generated post-split when scaler is available
         "output_data_path":  str(output_path),
         "decisions_required": [],
         "decisions_made":    [{"decision": "scaling_strategy", "chosen": strategy}],
@@ -352,18 +323,18 @@ def run(session: dict, decisions: dict) -> dict:
             "stage":   "normalisation",
             "title":   "Scaling Your Data",
             "summary": msg,
-            "decision_made": f"Applied {SCALING_STRATEGIES[strategy]['label']}.",
+            "decision_made": f"Scaling strategy '{strategy}' recorded.",
             "alternatives_considered": "Standard, Min-Max, Robust, and Power scaling were available.",
             "why_this_matters": (
-                "Scaling ensures the model treats all columns fairly — a column with values in the "
-                "thousands will not overshadow a column with values between 0 and 1 simply because "
-                "its numbers are bigger."
+                "Scaling ensures the model treats all columns fairly. "
+                "Fitting the scaler on training data only prevents the model from "
+                "learning the distribution of held-out test rows."
             )
         },
         "config_updates": {
             "scaling_strategy": strategy,
             "scaled_columns":   numeric_cols,
-            "scaler_path":      str(scaler_path),
+            "scaler_path":      None,
             "model_preference": model_preference
         }
     }
